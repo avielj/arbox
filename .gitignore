@@ -1,5 +1,6 @@
 .env
 deploy.conf
+.arbox_cache
 signups.csv
 sign.log
 *.log

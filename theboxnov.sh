@@ -29,6 +29,7 @@ CSV_FILE="$SCRIPT_DIR/signups.csv"
 LOG_FILE="$SCRIPT_DIR/sign.log"
 LOCK_FILE="$SCRIPT_DIR/.theboxnov.lock"
 ENV_FILE="$SCRIPT_DIR/.env"
+CACHE_FILE="$SCRIPT_DIR/.arbox_cache"
 
 DRY_RUN=false
 CLEANUP_ONLY=false
@@ -37,7 +38,7 @@ password=""
 signup_hour=""
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
-BOX_ID=70
+BOX_ID=""
 DAYS_AHEAD=12
 CLASS_FRIDAY="Fuck You Friday"
 CLASS_DEFAULT="CrossFit"
@@ -66,6 +67,38 @@ load_env() {
     done < "$ENV_FILE"
     log_message "Loaded config from .env"
   fi
+}
+
+# ── Cache management ──────────────────────────────────────────────────────
+load_cache() {
+  if [ -f "$CACHE_FILE" ]; then
+    while IFS='=' read -r key value; do
+      [[ "$key" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "$key" ]] && continue
+      case "$key" in
+        BOX_ID)              [ -z "$BOX_ID" ] && BOX_ID="$value" ;;
+        LOCATION_BOX_FK)     CACHED_LOCATION_BOX_FK="$value" ;;
+        MEMBERSHIP_USER_ID)  CACHED_MEMBERSHIP_USER_ID="$value" ;;
+        USER_FK)             CACHED_USER_FK="$value" ;;
+      esac
+    done < "$CACHE_FILE"
+    log_message "Loaded cached membership data from .arbox_cache"
+    return 0
+  fi
+  return 1
+}
+
+save_cache() {
+  local box_id="$1" location_box_fk="$2" membership_user_id="$3" user_fk="${4:-}"
+  cat > "$CACHE_FILE" <<EOF
+# Arbox membership cache (auto-generated, do not edit)
+# Fetched: $(date '+%Y-%m-%d %H:%M:%S')
+BOX_ID=$box_id
+LOCATION_BOX_FK=$location_box_fk
+MEMBERSHIP_USER_ID=$membership_user_id
+USER_FK=$user_fk
+EOF
+  log_message "Saved membership cache: box=$box_id location=$location_box_fk user=$membership_user_id"
 }
 
 # ── Dependency check ──────────────────────────────────────────────────────
@@ -335,26 +368,46 @@ do_signup() {
   fi
   log_message "Login successful"
 
-  local membership_response
-  membership_response=$(curl_with_retry GET "$API_BASE/boxes/$BOX_ID/memberships/1" "" "$access_token") || {
-    log_message "ERROR: Membership request failed"
-    send_telegram_message "Failed to fetch membership details"
-    exit 1
-  }
+  # Try loading membership data from cache
+  local location_box_fk="" box_fk="" membership_user_id=""
 
-  local location_box_fk box_fk membership_user_id
-  location_box_fk=$(echo "$membership_response" | jq -r '.data[0].membership_types.location_box_fk')
-  box_fk=$(echo "$membership_response" | jq -r '.data[0].box_fk')
-  membership_user_id=$(echo "$membership_response" | jq -r '.data[0].id')
+  if [ -n "$CACHED_LOCATION_BOX_FK" ] && [ -n "$CACHED_MEMBERSHIP_USER_ID" ] && [ -n "$BOX_ID" ]; then
+    location_box_fk="$CACHED_LOCATION_BOX_FK"
+    box_fk="$BOX_ID"
+    membership_user_id="$CACHED_MEMBERSHIP_USER_ID"
+    log_message "Using cached membership: box=$box_fk location=$location_box_fk user=$membership_user_id"
+  else
+    # First run or cache missing — discover from API
+    log_message "No cache found, fetching membership from API..."
 
-  if [ -z "$location_box_fk" ] || [ "$location_box_fk" = "null" ] || \
-     [ -z "$box_fk" ] || [ "$box_fk" = "null" ] || \
-     [ -z "$membership_user_id" ] || [ "$membership_user_id" = "null" ]; then
-    log_message "ERROR: Failed to retrieve membership details"
-    send_telegram_message "Failed to retrieve membership details"
-    exit 1
+    # If BOX_ID not set, try to discover it
+    local discover_box_id="${BOX_ID:-70}"
+    local membership_response
+    membership_response=$(curl_with_retry GET "$API_BASE/boxes/$discover_box_id/memberships/1" "" "$access_token") || {
+      log_message "ERROR: Membership request failed"
+      send_telegram_message "Failed to fetch membership details"
+      exit 1
+    }
+
+    location_box_fk=$(echo "$membership_response" | jq -r '.data[0].membership_types.location_box_fk')
+    box_fk=$(echo "$membership_response" | jq -r '.data[0].box_fk')
+    membership_user_id=$(echo "$membership_response" | jq -r '.data[0].id')
+    local user_fk
+    user_fk=$(echo "$membership_response" | jq -r '.data[0].user_fk // empty')
+
+    if [ -z "$location_box_fk" ] || [ "$location_box_fk" = "null" ] || \
+       [ -z "$box_fk" ] || [ "$box_fk" = "null" ] || \
+       [ -z "$membership_user_id" ] || [ "$membership_user_id" = "null" ]; then
+      log_message "ERROR: Failed to retrieve membership details"
+      send_telegram_message "Failed to retrieve membership details"
+      exit 1
+    fi
+
+    # Save to cache for next run
+    save_cache "$box_fk" "$location_box_fk" "$membership_user_id" "$user_fk"
+    BOX_ID="$box_fk"
+    log_message "Membership fetched & cached: box=$box_fk location=$location_box_fk user=$membership_user_id"
   fi
-  log_message "Membership: box=$box_fk location=$location_box_fk user=$membership_user_id"
 
   local signup_summary="" errors=""
   local new_signups=0 skipped=0 already=0 failed=0
@@ -540,6 +593,13 @@ main() {
   fi
 
   validate_hour "$signup_hour"
+
+  # Load cached membership data (BOX_ID, location, user)
+  CACHED_LOCATION_BOX_FK=""
+  CACHED_MEMBERSHIP_USER_ID=""
+  CACHED_USER_FK=""
+  load_cache || true
+
   rotate_log
 
   if [ -f "$CSV_FILE" ]; then
