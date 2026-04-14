@@ -2,21 +2,21 @@
 set -euo pipefail
 
 #=============================================================================
-# theboxnov.sh v2.0.0 — Arbox Auto-Signup Script (Improved)
+# arbox-signup.sh v2.1.0 — Arbox Auto-Signup Script
 #
 # Automatically signs up for CrossFit classes via Arbox API, up to N days
 # in advance. Sends notifications via Telegram.
 #
 # Usage:
-#   ./theboxnov.sh                    # Uses .env file for config
-#   ./theboxnov.sh -e EMAIL -p PASS -h 08:00
-#   ./theboxnov.sh --dry-run          # Preview without signing up
-#   ./theboxnov.sh --cleanup          # Remove old CSV entries (>30 days)
+#   ./arbox-signup.sh                    # Uses .env file for config
+#   ./arbox-signup.sh -e EMAIL -p PASS -h 08:00
+#   ./arbox-signup.sh --dry-run          # Preview without signing up
+#   ./arbox-signup.sh --cleanup          # Remove old CSV entries (>30 days)
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -27,7 +27,7 @@ readonly API_BASE="https://apiappv2.arboxapp.com/api/v2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CSV_FILE="$SCRIPT_DIR/signups.csv"
 LOG_FILE="$SCRIPT_DIR/sign.log"
-LOCK_FILE="$SCRIPT_DIR/.theboxnov.lock"
+LOCK_FILE="$SCRIPT_DIR/.arbox-signup.lock"
 ENV_FILE="$SCRIPT_DIR/.env"
 CACHE_FILE="$SCRIPT_DIR/.arbox_cache"
 
@@ -134,7 +134,7 @@ acquire_lock() {
         rm -f "$LOCK_FILE"
       else
         log_message "ERROR: Another instance running (PID: $lock_pid)"
-        send_telegram_message "Warning: Arbox script blocked by PID $lock_pid"
+        send_telegram_message "⚠️ Arbox script blocked by another instance (PID $lock_pid)"
         exit 1
       fi
     else
@@ -319,7 +319,7 @@ parse_args() {
       -h) signup_hour="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --cleanup) CLEANUP_ONLY=true; shift ;;
-      --version) echo "theboxnov.sh v$VERSION"; exit 0 ;;
+      --version) echo "arbox-signup.sh v$VERSION"; exit 0 ;;
       --help)    show_help; exit 0 ;;
       *) echo "Unknown option: $1"; show_help; exit 1 ;;
     esac
@@ -328,7 +328,7 @@ parse_args() {
 
 show_help() {
   cat <<EOF
-theboxnov.sh v$VERSION - Arbox Auto-Signup
+arbox-signup.sh v$VERSION - Arbox Auto-Signup
 
 Usage: $0 [options]
 
@@ -353,7 +353,7 @@ do_signup() {
   login_response=$(curl_with_retry POST "$API_BASE/user/login" \
     "{\"email\":\"$email\",\"password\":\"$password\"}") || {
     log_message "ERROR: Login request failed"
-    send_telegram_message "Login request failed (network error)"
+    send_telegram_message "❌ Login request failed (network error)"
     exit 1
   }
 
@@ -363,7 +363,7 @@ do_signup() {
     local err
     err=$(echo "$login_response" | jq -r '.message // "Unknown error"')
     log_message "ERROR: Login failed: $err"
-    send_telegram_message "Login failed: $err"
+    send_telegram_message "❌ Login failed: $err"
     exit 1
   fi
   log_message "Login successful"
@@ -385,7 +385,7 @@ do_signup() {
     local membership_response
     membership_response=$(curl_with_retry GET "$API_BASE/boxes/$discover_box_id/memberships/1" "" "$access_token") || {
       log_message "ERROR: Membership request failed"
-      send_telegram_message "Failed to fetch membership details"
+      send_telegram_message "❌ Failed to fetch membership details"
       exit 1
     }
 
@@ -399,7 +399,7 @@ do_signup() {
        [ -z "$box_fk" ] || [ "$box_fk" = "null" ] || \
        [ -z "$membership_user_id" ] || [ "$membership_user_id" = "null" ]; then
       log_message "ERROR: Failed to retrieve membership details"
-      send_telegram_message "Failed to retrieve membership details"
+      send_telegram_message "❌ Failed to retrieve membership details"
       exit 1
     fi
 
@@ -435,7 +435,7 @@ do_signup() {
     check_schedule=$(curl_with_retry POST "$API_BASE/schedule/betweenDates" \
       '{"from":"'"$check_date"'","to":"'"$check_date"'","locations_box_id":'"$location_box_fk"',"boxes_id":'"$box_fk"'}' \
       "$access_token") || {
-      errors="${errors}$day $check_date: schedule fetch failed\n"
+      errors="${errors}❌ $day $check_date: schedule fetch failed\n"
       failed=$((failed + 1))
       continue
     }
@@ -463,7 +463,7 @@ do_signup() {
     fi
 
     if $DRY_RUN; then
-      signup_summary="${signup_summary}[DRY] $day $check_date $check_class_name${capacity_info}\n"
+      signup_summary="${signup_summary}🔍 $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
       log_message "[DRY RUN] $check_date - Would sign up"
       continue
@@ -474,7 +474,7 @@ do_signup() {
     signup_response=$(curl_with_retry POST "$API_BASE/scheduleUser/insert" \
       '{"schedule_id":'"$class_id"',"membership_user_id":'"$membership_user_id"'}' \
       "$access_token") || {
-      errors="${errors}$day $check_date: signup request failed\n"
+      errors="${errors}❌ $day $check_date: signup request failed\n"
       failed=$((failed + 1))
       continue
     }
@@ -487,7 +487,7 @@ do_signup() {
       log_message "Day $days_ahead: $check_date - Already signed (514)"
     elif echo "$signup_response" | jq -e '.data' >/dev/null 2>&1; then
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "signed_up"
-      signup_summary="${signup_summary}$day $check_date $check_class_name${capacity_info}\n"
+      signup_summary="${signup_summary}✅ $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
       log_message "Day $days_ahead: $check_date - Signed up!"
     else
@@ -503,15 +503,15 @@ do_signup() {
 
         if [ -n "$wl_response" ] && echo "$wl_response" | jq -e '.data' >/dev/null 2>&1; then
           add_to_csv "$check_date" "$signup_hour" "$check_class_name" "waitlist"
-          signup_summary="${signup_summary}[WL] $day $check_date${capacity_info}\n"
+          signup_summary="${signup_summary}📋 $day $check_date (waitlist)${capacity_info}\n"
           log_message "Day $days_ahead: $check_date - Waitlisted"
         else
-          errors="${errors}$day $check_date: full + waitlist failed\n"
+          errors="${errors}❌ $day $check_date: full + waitlist failed\n"
           failed=$((failed + 1))
           log_message "Day $days_ahead: $check_date - Full, waitlist failed"
         fi
       else
-        errors="${errors}$day $check_date: $error_msg\n"
+        errors="${errors}❌ $day $check_date: $error_msg\n"
         failed=$((failed + 1))
         log_message "Day $days_ahead: $check_date - Failed: $error_msg"
       fi
@@ -535,7 +535,7 @@ do_signup() {
         local cat_name
         cat_name=$(echo "$cat_data" | jq -r '.[0][0].box_categories.name // empty')
         if [ "$cat_name" = "CrossFit" ]; then
-          crossfit_workout="Workout:"$'\n'
+          crossfit_workout="💪 Today's Workout:"$'\n'
           local sc
           sc=$(echo "$cat_data" | jq 'length')
           for ((i=0; i<sc; i++)); do
@@ -543,7 +543,7 @@ do_signup() {
             sn=$(echo "$cat_data" | jq -r ".[$i][0].box_sections.name // empty")
             scm=$(echo "$cat_data" | jq -r ".[$i][0].comment // empty")
             if [ -n "$scm" ] && [ "$scm" != "null" ]; then
-              crossfit_workout="$crossfit_workout"$'\n'"$sn:"$'\n'"$scm"$'\n'
+              crossfit_workout="$crossfit_workout"$'\n'"🔹 $sn:"$'\n'"$scm"$'\n'
             fi
           done
         fi
@@ -556,11 +556,11 @@ do_signup() {
   $DRY_RUN && prefix="[DRY RUN] "
 
   if [ $new_signups -gt 0 ] || [ -n "$errors" ]; then
-    local msg="${prefix}Signup Report for $signup_hour"
-    msg="$msg"$'\n'"New: $new_signups | Already: $already | Skipped: $skipped | Failed: $failed"
+    local msg="${prefix}🏋️ Arbox Signup Report — $signup_hour"
+    msg="$msg"$'\n'"📊 New: $new_signups | ✅ Already: $already | ⏭️ Skipped: $skipped | ❌ Failed: $failed"
 
-    [ $new_signups -gt 0 ] && msg="$msg"$'\n\n'"New Signups:"$'\n'"$(echo -e "$signup_summary")"
-    [ -n "$errors" ] && msg="$msg"$'\n\n'"Errors:"$'\n'"$(echo -e "$errors")"
+    [ $new_signups -gt 0 ] && msg="$msg"$'\n\n'"✨ New Signups:"$'\n'"$(echo -e "$signup_summary")"
+    [ -n "$errors" ] && msg="$msg"$'\n\n'"⚠️ Errors:"$'\n'"$(echo -e "$errors")"
     [ -n "$crossfit_workout" ] && msg="$msg"$'\n\n'"$crossfit_workout"
 
     send_telegram_message "$msg"
@@ -610,9 +610,9 @@ main() {
 
   init_csv
   acquire_lock
-  log_message "=== theboxnov.sh v$VERSION started ==="
+  log_message "=== arbox-signup.sh v$VERSION started ==="
   do_signup
-  log_message "=== theboxnov.sh v$VERSION finished ==="
+  log_message "=== arbox-signup.sh v$VERSION finished ==="
 }
 
 main "$@"

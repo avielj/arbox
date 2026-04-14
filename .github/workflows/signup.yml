@@ -1,0 +1,68 @@
+name: 🏋️ Arbox Auto-Signup
+
+on:
+  # Run daily at 06:01 UTC (same as crontab)
+  schedule:
+    - cron: '1 6 * * *'
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview only, no signups)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl
+
+      - name: 📝 Create .env from secrets
+        run: |
+          cat > .env <<EOF
+          ARBOX_EMAIL=${{ secrets.ARBOX_EMAIL }}
+          ARBOX_PASSWORD=${{ secrets.ARBOX_PASSWORD }}
+          SIGNUP_HOUR=${{ secrets.SIGNUP_HOUR }}
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          DAYS_AHEAD=${{ vars.DAYS_AHEAD || '12' }}
+          CLASS_FRIDAY=${{ vars.CLASS_FRIDAY || 'Fuck You Friday' }}
+          CLASS_DEFAULT=${{ vars.CLASS_DEFAULT || 'CrossFit' }}
+          SKIP_DAYS=${{ vars.SKIP_DAYS || 'Saturday' }}
+          EOF
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' .env
+
+      - name: 🔑 Restore membership cache
+        uses: actions/cache@v4
+        with:
+          path: .arbox_cache
+          key: arbox-cache-${{ secrets.ARBOX_EMAIL }}
+
+      - name: 🏋️ Run signup script
+        run: |
+          chmod +x arbox-signup.sh
+          FLAGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            FLAGS="--dry-run"
+          fi
+          ./arbox-signup.sh $FLAGS
+
+      - name: 📊 Show results
+        if: always()
+        run: |
+          echo "=== Last 30 log lines ==="
+          tail -30 sign.log 2>/dev/null || echo "No log file"
+          echo ""
+          echo "=== Cache ==="
+          cat .arbox_cache 2>/dev/null || echo "No cache file"

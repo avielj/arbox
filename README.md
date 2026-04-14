@@ -2,7 +2,7 @@
 
 > Automatically sign up for CrossFit classes via the [Arbox](https://arboxapp.com) API — up to 12 days in advance, with Telegram notifications, waitlist support, and zero manual effort.
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-green)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey)
 
@@ -38,12 +38,12 @@ cp .env.example .env
 nano .env  # Add your Arbox & Telegram credentials
 
 # 3. Run
-chmod +x theboxnov.sh
-./theboxnov.sh
+chmod +x arbox-signup.sh
+./arbox-signup.sh
 
 # 4. (Optional) Schedule via cron
 crontab -e
-# Add: 1 6 * * * /path/to/theboxnov.sh >/dev/null 2>&1
+# Add: 1 6 * * * /path/to/arbox-signup.sh >/dev/null 2>&1
 ```
 
 ---
@@ -71,11 +71,11 @@ crontab -e
 ## Usage
 
 ```bash
-./theboxnov.sh                # Use .env config (recommended)
-./theboxnov.sh --dry-run      # Preview without signing up
-./theboxnov.sh --cleanup      # Remove old CSV entries
-./theboxnov.sh --version      # Show version
-./theboxnov.sh --help         # Show all options
+./arbox-signup.sh                # Use .env config (recommended)
+./arbox-signup.sh --dry-run      # Preview without signing up
+./arbox-signup.sh --cleanup      # Remove old CSV entries
+./arbox-signup.sh --version      # Show version
+./arbox-signup.sh --help         # Show all options
 ```
 
 <details>
@@ -101,7 +101,7 @@ CLI args override `.env` values.
 
 ```cron
 # Run daily at 06:01 UTC
-1 6 * * * /path/to/theboxnov.sh >/dev/null 2>&1
+1 6 * * * /path/to/arbox-signup.sh >/dev/null 2>&1
 ```
 
 ---
@@ -136,14 +136,15 @@ CLI args override `.env` values.
 
 | File | Git | Description |
 |------|:---:|-------------|
-| `theboxnov.sh` | ✅ | Main script |
+| `arbox-signup.sh` | ✅ | Main script |
 | `.env.example` | ✅ | Config template (no secrets) |
+| `.github/workflows/signup.yml` | ✅ | GitHub Actions workflow |
 | `README.md` | ✅ | This file |
 | `.env` | 🚫 | Your actual credentials |
 | `.arbox_cache` | 🚫 | Cached membership IDs (auto-generated) |
 | `signups.csv` | 🚫 | Signup log (auto-cleaned after 30 days) |
 | `sign.log` | 🚫 | Detailed log (auto-rotated at 5 MB) |
-| `.theboxnov.lock` | 🚫 | Lock file (auto-managed) |
+| `.arbox-signup.lock` | 🚫 | Lock file (auto-managed) |
 
 ---
 
@@ -170,6 +171,44 @@ All checked automatically at startup.
 | `/api/v2/user/feed` | GET | Today's workout |
 
 </details>
+
+---
+
+## GitHub Actions (serverless option)
+
+Run the script automatically via GitHub Actions — no server needed.
+
+### Setup
+
+1. Go to your repo → **Settings** → **Secrets and variables** → **Actions**
+
+2. Add these **Secrets** (required):
+
+   | Secret | Value |
+   |--------|-------|
+   | `ARBOX_EMAIL` | Your Arbox email |
+   | `ARBOX_PASSWORD` | Your Arbox password |
+   | `SIGNUP_HOUR` | e.g., `08:00` |
+   | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token |
+   | `TELEGRAM_CHAT_ID` | Your Telegram chat ID |
+
+3. (Optional) Add **Variables** for non-secret config:
+
+   | Variable | Default |
+   |----------|---------|
+   | `DAYS_AHEAD` | `12` |
+   | `CLASS_FRIDAY` | `Fuck You Friday` |
+   | `CLASS_DEFAULT` | `CrossFit` |
+   | `SKIP_DAYS` | `Saturday` |
+
+### How it runs
+
+- **Scheduled:** Daily at 06:01 UTC (same as crontab)
+- **Manual:** Go to Actions tab → "Arbox Auto-Signup" → "Run workflow"
+- **Dry run:** Check the "Dry run" box when triggering manually
+- **Cache:** Membership IDs are cached between runs via GitHub Actions cache
+
+> 💡 You can use GitHub Actions **instead of** or **alongside** a cron server. Both work independently.
 
 ---
 
