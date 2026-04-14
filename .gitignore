@@ -1,0 +1,7 @@
+.env
+deploy.conf
+signups.csv
+sign.log
+*.log
+*.bak
+.theboxnov.lock
