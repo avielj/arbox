@@ -18,33 +18,59 @@ jobs:
   signup:
     runs-on: ubuntu-latest
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: 📥 Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 🔧 Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl
 
+      - name: � Validate secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.ARBOX_EMAIL }}" ] && missing="$missing ARBOX_EMAIL"
+          [ -z "${{ secrets.ARBOX_PASSWORD }}" ] && missing="$missing ARBOX_PASSWORD"
+          [ -z "${{ secrets.SIGNUP_HOUR }}" ] && missing="$missing SIGNUP_HOUR"
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && missing="$missing TELEGRAM_BOT_TOKEN"
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && missing="$missing TELEGRAM_CHAT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required secrets:$missing"
+            echo "Go to Settings → Secrets and variables → Actions to add them."
+            exit 1
+          fi
+          echo "✅ All required secrets are configured"
+
       - name: 📝 Create .env from secrets
         run: |
-          cat > .env <<EOF
-          ARBOX_EMAIL=${{ secrets.ARBOX_EMAIL }}
-          ARBOX_PASSWORD=${{ secrets.ARBOX_PASSWORD }}
-          SIGNUP_HOUR=${{ secrets.SIGNUP_HOUR }}
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          DAYS_AHEAD=${{ vars.DAYS_AHEAD || '12' }}
-          CLASS_FRIDAY=${{ vars.CLASS_FRIDAY || 'Fuck You Friday' }}
-          CLASS_DEFAULT=${{ vars.CLASS_DEFAULT || 'CrossFit' }}
-          SKIP_DAYS=${{ vars.SKIP_DAYS || 'Saturday' }}
-          EOF
-          # Remove leading whitespace from heredoc
+          cat > .env <<'ENVEOF'
+          ARBOX_EMAIL=__ARBOX_EMAIL__
+          ARBOX_PASSWORD=__ARBOX_PASSWORD__
+          SIGNUP_HOUR=__SIGNUP_HOUR__
+          TELEGRAM_BOT_TOKEN=__TELEGRAM_BOT_TOKEN__
+          TELEGRAM_CHAT_ID=__TELEGRAM_CHAT_ID__
+          DAYS_AHEAD=__DAYS_AHEAD__
+          CLASS_FRIDAY=__CLASS_FRIDAY__
+          CLASS_DEFAULT=__CLASS_DEFAULT__
+          SKIP_DAYS=__SKIP_DAYS__
+          ENVEOF
           sed -i 's/^          //' .env
+          sed -i "s|__ARBOX_EMAIL__|${{ secrets.ARBOX_EMAIL }}|" .env
+          sed -i "s|__ARBOX_PASSWORD__|${{ secrets.ARBOX_PASSWORD }}|" .env
+          sed -i "s|__SIGNUP_HOUR__|${{ secrets.SIGNUP_HOUR }}|" .env
+          sed -i "s|__TELEGRAM_BOT_TOKEN__|${{ secrets.TELEGRAM_BOT_TOKEN }}|" .env
+          sed -i "s|__TELEGRAM_CHAT_ID__|${{ secrets.TELEGRAM_CHAT_ID }}|" .env
+          sed -i "s|__DAYS_AHEAD__|${{ vars.DAYS_AHEAD || '12' }}|" .env
+          sed -i "s|__CLASS_FRIDAY__|${{ vars.CLASS_FRIDAY || 'Fuck You Friday' }}|" .env
+          sed -i "s|__CLASS_DEFAULT__|${{ vars.CLASS_DEFAULT || 'CrossFit' }}|" .env
+          sed -i "s|__SKIP_DAYS__|${{ vars.SKIP_DAYS || 'Saturday' }}|" .env
 
       - name: 🔑 Restore membership cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .arbox_cache
           key: arbox-cache-${{ secrets.ARBOX_EMAIL }}
