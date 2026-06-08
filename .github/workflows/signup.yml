@@ -102,10 +102,22 @@ jobs:
           cat .arbox_cache 2>/dev/null || echo "No cache file"
 
       # Keeps this scheduled workflow alive. GitHub disables cron workflows
-      # after 60 days of repository inactivity; this creates a dummy commit
-      # only when the repo is close to that limit, resetting the timer.
+      # after 60 days of repository inactivity. This pushes an empty commit
+      # only when the latest commit is older than 45 days, resetting the
+      # timer. Implemented inline (no third-party action) because this repo's
+      # Actions policy only allows GitHub-owned actions.
       - name: ♻️ Keepalive
         if: always()
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          time_elapsed: 45
+        run: |
+          last_commit_epoch=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last_commit_epoch ) / 86400 ))
+          echo "Days since last commit: $age_days"
+          if [ "$age_days" -ge 45 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive to keep scheduled workflow active"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Pushed keepalive commit."
+          else
+            echo "No keepalive needed yet (threshold: 45 days)."
+          fi
