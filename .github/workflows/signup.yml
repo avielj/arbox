@@ -51,28 +51,31 @@ jobs:
           echo "✅ All required secrets are configured"
 
       - name: 📝 Create .env from secrets
+        # Secrets are passed through env vars (not interpolated into the
+        # script body) so values containing |, &, \, $ etc. are handled
+        # safely and aren't exposed to shell/script injection.
+        env:
+          ARBOX_EMAIL: ${{ secrets.ARBOX_EMAIL }}
+          ARBOX_PASSWORD: ${{ secrets.ARBOX_PASSWORD }}
+          SIGNUP_HOUR: ${{ secrets.SIGNUP_HOUR }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '12' }}
+          CLASS_FRIDAY: ${{ vars.CLASS_FRIDAY || 'Fuck You Friday' }}
+          CLASS_DEFAULT: ${{ vars.CLASS_DEFAULT || 'CrossFit' }}
+          SKIP_DAYS: ${{ vars.SKIP_DAYS || 'Saturday' }}
         run: |
-          cat > .env <<'ENVEOF'
-          ARBOX_EMAIL=__ARBOX_EMAIL__
-          ARBOX_PASSWORD=__ARBOX_PASSWORD__
-          SIGNUP_HOUR=__SIGNUP_HOUR__
-          TELEGRAM_BOT_TOKEN=__TELEGRAM_BOT_TOKEN__
-          TELEGRAM_CHAT_ID=__TELEGRAM_CHAT_ID__
-          DAYS_AHEAD=__DAYS_AHEAD__
-          CLASS_FRIDAY=__CLASS_FRIDAY__
-          CLASS_DEFAULT=__CLASS_DEFAULT__
-          SKIP_DAYS=__SKIP_DAYS__
-          ENVEOF
-          sed -i 's/^          //' .env
-          sed -i "s|__ARBOX_EMAIL__|${{ secrets.ARBOX_EMAIL }}|" .env
-          sed -i "s|__ARBOX_PASSWORD__|${{ secrets.ARBOX_PASSWORD }}|" .env
-          sed -i "s|__SIGNUP_HOUR__|${{ secrets.SIGNUP_HOUR }}|" .env
-          sed -i "s|__TELEGRAM_BOT_TOKEN__|${{ secrets.TELEGRAM_BOT_TOKEN }}|" .env
-          sed -i "s|__TELEGRAM_CHAT_ID__|${{ secrets.TELEGRAM_CHAT_ID }}|" .env
-          sed -i "s|__DAYS_AHEAD__|${{ vars.DAYS_AHEAD || '12' }}|" .env
-          sed -i "s|__CLASS_FRIDAY__|${{ vars.CLASS_FRIDAY || 'Fuck You Friday' }}|" .env
-          sed -i "s|__CLASS_DEFAULT__|${{ vars.CLASS_DEFAULT || 'CrossFit' }}|" .env
-          sed -i "s|__SKIP_DAYS__|${{ vars.SKIP_DAYS || 'Saturday' }}|" .env
+          {
+            printf 'ARBOX_EMAIL=%s\n'        "$ARBOX_EMAIL"
+            printf 'ARBOX_PASSWORD=%s\n'     "$ARBOX_PASSWORD"
+            printf 'SIGNUP_HOUR=%s\n'        "$SIGNUP_HOUR"
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_CHAT_ID=%s\n'   "$TELEGRAM_CHAT_ID"
+            printf 'DAYS_AHEAD=%s\n'         "$DAYS_AHEAD"
+            printf 'CLASS_FRIDAY=%s\n'       "$CLASS_FRIDAY"
+            printf 'CLASS_DEFAULT=%s\n'      "$CLASS_DEFAULT"
+            printf 'SKIP_DAYS=%s\n'          "$SKIP_DAYS"
+          } > .env
 
       - name: 🔑 Restore membership cache
         uses: actions/cache@v5
