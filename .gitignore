@@ -5,4 +5,5 @@ signups.csv
 sign.log
 *.log
 *.bak
-.theboxnov.lock\n.arbox-signup.lock
+.theboxnov.lock
+.arbox-signup.lock

@@ -280,8 +280,8 @@ send_telegram_message() {
     return 0
   fi
   curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d chat_id="$TELEGRAM_CHAT_ID" \
-    -d text="$1" \
+    --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+    --data-urlencode text="$1" \
     --max-time 10 >/dev/null 2>&1 || log_message "WARNING: Telegram send failed"
 }
 
@@ -349,9 +349,12 @@ EOF
 # ── Main signup logic ─────────────────────────────────────────────────────
 do_signup() {
   log_message "Logging in as $email"
+  local login_payload
+  login_payload=$(jq -n --arg email "$email" --arg password "$password" \
+    '{email: $email, password: $password}')
   local login_response
   login_response=$(curl_with_retry POST "$API_BASE/user/login" \
-    "{\"email\":\"$email\",\"password\":\"$password\"}") || {
+    "$login_payload") || {
     log_message "ERROR: Login request failed"
     send_telegram_message "❌ Login request failed (network error)"
     exit 1
