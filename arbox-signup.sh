@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.4"
+readonly VERSION="2.2.5"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -301,7 +301,7 @@ curl_with_retry() {
     raw_response=$(cat "$tmp_body" 2>/dev/null || true)
     rm -f "$tmp_body"
     printf '%s' "$http_code" > "$HTTP_STATUS_FILE" 2>/dev/null || true
-    body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' | head -c 300)
+    body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' | head -c 300 || true)
 
     if [ -n "$raw_response" ] && echo "$raw_response" | jq empty 2>/dev/null; then
       if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
@@ -676,12 +676,18 @@ do_invite_friend() {
     local check_schedule
     check_schedule=$(curl_with_retry POST "$API_BASE/schedule/betweenDates" \
       '{"from":"'"$check_date"'","to":"'"$check_date"'","locations_box_id":'"$LOCATION_BOX_FK"',"boxes_id":'"$BOX_FK"'}' \
-      "$ACCESS_TOKEN") || continue
+      "$ACCESS_TOKEN") || { log_message "Invite probe: $check_date fetch failed (HTTP $(last_http_status))"; continue; }
+    local n_classes
+    n_classes=$(echo "$check_schedule" | jq -r '.data | length')
     local check_class
     check_class=$(echo "$check_schedule" | jq -r '.data[] | select(.time=="'"$signup_hour"'" and .box_categories.name=="'"$check_class_name"'")')
-    [ -z "$check_class" ] || [ "$check_class" = "null" ] && continue
+    if [ -z "$check_class" ] || [ "$check_class" = "null" ]; then
+      log_message "Invite probe: $check_date ($day) - no $check_class_name at $signup_hour (classes in day: ${n_classes:-?})"
+      continue
+    fi
     local booking_option
     booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
+    log_message "Invite probe: $check_date ($day) - found $check_class_name, booking_option=${booking_option:-absent}"
     if [ -n "$booking_option" ] && [ "$booking_option" != "registerToSchedule" ]; then
       log_message "Invite probe: $check_date window closed (booking_option=$booking_option), trying next day"
       continue
