@@ -13,12 +13,12 @@ set -euo pipefail
 #   ./arbox-signup.sh --dry-run          # Preview without signing up
 #   ./arbox-signup.sh --cleanup          # Remove old CSV entries (>30 days)
 #   ./arbox-signup.sh --list-friends     # List friends from your profile
-#   ./arbox-signup.sh --invite-friend "NAME"  # Invite probe (UNVERIFIED endpoint)
+#   ./arbox-signup.sh --invite-friend "NAME"  # Invite a friend (POST userToUser/schedule/invite)
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.6"
+readonly VERSION="2.2.7"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -426,8 +426,10 @@ Options:
   --list-friends List friends from your Arbox profile (no signups)
   --invite-friend NAME
                  Invite a friend (by name, case-insensitive substring) to
-                 the next upcoming class. UNVERIFIED endpoint probe — see
-                 do_invite_friend. Manual use only, never in the daily run.
+                 the next upcoming class: POST userToUser/schedule/invite
+                 (endpoint from the Arbox web-app bundle). The friend must
+                 approve in the app to join. Manual use only, never in the
+                 daily run.
   --version      Show version
   --help         Show this help
 
@@ -608,14 +610,16 @@ do_list_friends() {
   log_message "Listed $count friends"
 }
 
-# ── Invite a friend (UNVERIFIED PROBE) ───────────────────────────────────
-# There is NO public friend-invite endpoint. This mode tries one hypothesis:
-# POST /api/v2/scheduleUser/insert with the FRIEND's membership_user_id
-# (taken from their users_boxes_active entry for our box). The server very
-# likely rejects this (the membership must belong to the token owner), so
-# expect a failure — and treat any "success" with suspicion until the
-# booking is confirmed in the Arbox app. Manual use only, never scheduled.
-# Only the NEXT upcoming 08:00 class is attempted, never the whole 12 days.
+# ── Invite a friend ──────────────────────────────────────────────────────
+# Real endpoint, found Nov 16 2026 in Arbox's own web-app code
+# (site.arboxapp.com SPA bundle, app chunk): POST /api/v2/userToUser/schedule/invite
+# with body {schedule_id, friend_users_id}; success iff response .data is
+# true or "OK". The friend then gets an invitation card (ACTION_SCHEDULE_INVITATION)
+# and joins by booking the class themselves — the app never books on
+# another user's behalf, and there is no accept endpoint in the bundle.
+# Manual use only, never scheduled. Only the NEXT upcoming 08:00 class is
+# attempted, never the whole 12 days. First live call of this endpoint is
+# still unproven — verify in the app that the friend got the invite.
 do_invite_friend() {
   local query="$1"
   arbox_login
@@ -647,22 +651,11 @@ do_invite_friend() {
     exit 1
   fi
 
-  local friend_name friend_users_id friend_membership_id
+  local friend_name friend_users_id
   friend_name=$(echo "$match_json" | jq -r '.[0].friend_user.full_name // "unknown"')
   friend_users_id=$(echo "$match_json" | jq -r '.[0].friend_users_id')
-  # Prefer the membership row for OUR box (same business); fall back to the
-  # first users_boxes_active entry. The id used is UsersBoxActive.id.
-  friend_membership_id=$(echo "$match_json" | jq -r --argjson box "$BOX_FK" '
-    ((.[0].friend_user.users_boxes_active // []) | if type == "array" then . else to_entries | map(.value) end) as $boxes
-    | (($boxes | map(select(.box_fk == $box)) | .[0]) // $boxes[0]) | .id // empty')
-
-  if [ -z "$friend_membership_id" ] || [ "$friend_membership_id" = "null" ]; then
-    echo "Found $friend_name but no usable membership id (users_boxes_active is empty)."
-    log_message "Invite probe: $friend_name has no membership id"
-    exit 1
-  fi
-  echo "Invite probe (UNVERIFIED endpoint): $friend_name (friend_users_id=$friend_users_id) via membership_user_id=$friend_membership_id"
-  log_message "Invite probe: $friend_name (friend_users_id=$friend_users_id, membership_user_id=$friend_membership_id)"
+  echo "Invite: $friend_name (friend_users_id=$friend_users_id) via POST userToUser/schedule/invite"
+  log_message "Invite: $friend_name (friend_users_id=$friend_users_id) via userToUser/schedule/invite"
 
   # Find the next upcoming 08:00 class (skips Saturdays, respects the
   # booking-window flag when present).
@@ -696,6 +689,12 @@ do_invite_friend() {
       class_day="$day"; class_date="$check_date"; class_name="$check_class_name"
       break
     fi
+    # Full class — inviting a friend there is pointless (they couldn't
+    # book). Skip it and try the next day.
+    if [ "$booking_option" = "insertStandby" ] || [ "$booking_option" = "cancelWaitList" ]; then
+      log_message "Invite probe: $check_date class is full (booking_option=$booking_option), trying next day"
+      continue
+    fi
     if [ -n "$booking_option" ] && [ "$booking_option" != "insertScheduleUser" ] && [ "$booking_option" != "registerToSchedule" ]; then
       log_message "Invite probe: $check_date window closed (booking_option=$booking_option), trying next day"
       continue
@@ -711,30 +710,27 @@ do_invite_friend() {
     exit 1
   fi
 
-  echo "Invite probe: attempting $class_day $class_date $class_name (schedule_id=$class_id) for $friend_name..."
+  echo "Invite: sending $friend_name an invite to $class_day $class_date $class_name (schedule_id=$class_id)..."
   local invite_response
-  invite_response=$(curl_with_retry POST "$API_BASE/scheduleUser/insert" \
-    '{"schedule_id":'"$class_id"',"membership_user_id":'"$friend_membership_id"'}' \
+  invite_response=$(curl_with_retry POST "$API_BASE/userToUser/schedule/invite" \
+    '{"schedule_id":'"$class_id"',"friend_users_id":'"$friend_users_id"'}' \
     "$ACCESS_TOKEN") || true
 
-  local status_code probe_msg
+  local invite_data status_code probe_msg
+  invite_data=$(echo "$invite_response" | jq -r '.data // empty' 2>/dev/null || echo "")
   status_code=$(echo "$invite_response" | jq -r '.statusCode // empty' 2>/dev/null || echo "")
   probe_msg=$(echo "$invite_response" | jq -r '.message // .error.message // empty' 2>/dev/null || echo "")
-  if [ -n "$invite_response" ] && echo "$invite_response" | jq -e '.data' >/dev/null 2>&1; then
-    echo "Invite probe: Arbox returned .data for $friend_name on $class_day $class_date — VERIFY IN THE APP that the friend is actually booked (this endpoint use is unverified)."
-    log_message "Invite probe: .data returned for $friend_name on $class_date (UNVERIFIED — verify in app)"
-    send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): $friend_name → $class_day $class_date $class_name — Arbox returned .data. Verify in the Arbox app that the friend is actually booked."
+  # Per the app bundle: success iff .data is true or "OK". The friend then
+  # sees an invitation card and joins by booking the class themselves.
+  if [ "$invite_data" = "true" ] || [ "$invite_data" = "OK" ]; then
+    echo "Invite: $friend_name invited to $class_day $class_date — they must approve in the Arbox app to join."
+    log_message "Invite: $friend_name invited to $class_date (data=$invite_data)"
+    send_telegram_message "📨 Invite sent: $friend_name → $class_day $class_date $class_name. They need to approve in the Arbox app."
     return 0
   fi
-  if [ "$status_code" = "514" ]; then
-    echo "Invite probe: $friend_name is already signed up for $class_day $class_date (status 514)."
-    log_message "Invite probe: $friend_name already signed up (514) for $class_date"
-    send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): $friend_name already signed up for $class_day $class_date (514)."
-    return 0
-  fi
-  echo "Invite probe: FAILED for $friend_name on $class_day $class_date (HTTP $(last_http_status), message: ${probe_msg:-none})."
-  log_message "Invite probe: FAILED for $friend_name on $class_date (HTTP $(last_http_status), message: ${probe_msg:-none})"
-  send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): FAILED for $friend_name on $class_day $class_date (HTTP $(last_http_status))."
+  echo "Invite: FAILED for $friend_name on $class_day $class_date (HTTP $(last_http_status), statusCode=${status_code:-none}, message: ${probe_msg:-none})."
+  log_message "Invite: FAILED for $friend_name on $class_date (HTTP $(last_http_status), statusCode=${status_code:-none}, message: ${probe_msg:-none})"
+  send_telegram_message "📨 Invite FAILED: $friend_name → $class_day $class_date (HTTP $(last_http_status))."
   return 1
 }
 
@@ -797,10 +793,14 @@ do_signup() {
       continue
     fi
 
-    # Booking window (live evidence, run #228, Nov 16 2026): booking_option
-    # is the action available for THIS user, not a generic open/closed flag:
-    # 'cancelScheduleUser' = already signed up (the cancel action is what's
-    # offered); 'insertScheduleUser' / 'registerToSchedule' = open now.
+    # Booking window (live run #228 + the app's own SPA bundle, Nov 16 2026):
+    # booking_option is the action available for THIS user, and only these
+    # four values exist in the bundle — 'registerToSchedule' appears 0 times
+    # (arbox-bot's claim is stale; kept below defensively):
+    #   cancelScheduleUser = already signed up
+    #   insertScheduleUser = open, book directly
+    #   insertStandby      = full, go straight to the waitlist endpoint
+    #   cancelWaitList     = already on the waitlist
     # Anything else = window not open — skip without counting as failed.
     local booking_option
     booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
@@ -808,6 +808,24 @@ do_signup() {
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "already_signed_up"
       already=$((already + 1))
       log_message "Day $days_ahead: $check_date - Already signed up (booking_option=cancelScheduleUser)"
+      continue
+    fi
+    if [ "$booking_option" = "cancelWaitList" ]; then
+      add_to_csv "$check_date" "$signup_hour" "$check_class_name" "waitlist"
+      log_message "Day $days_ahead: $check_date - Already on the waitlist (booking_option=cancelWaitList)"
+      continue
+    fi
+    if [ "$booking_option" = "insertStandby" ]; then
+      local standby_class_id
+      standby_class_id=$(echo "$check_class" | jq -r '.id')
+      log_message "Day $days_ahead: $check_date - Full (booking_option=insertStandby), trying waitlist"
+      if try_standby "$standby_class_id" "$day" "$check_date" "$check_class_name"; then
+        :
+      else
+        errors="${errors}❌ $day $check_date: full + waitlist failed (HTTP $(last_http_status))\n"
+        failed=$((failed + 1))
+        log_message "Day $days_ahead: $check_date - Full, waitlist failed"
+      fi
       continue
     fi
     if [ -n "$booking_option" ] && [ "$booking_option" != "insertScheduleUser" ] && [ "$booking_option" != "registerToSchedule" ]; then
