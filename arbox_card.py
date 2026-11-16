@@ -151,11 +151,15 @@ def _fmt_date(date_str):
         return date_str
 
 
-def build_card(signups, out_path="card.png", run_date=None):
-    """Render the card. signups: list of {day, date, class, time} dicts."""
+def build_card(signups, out_path="card.png", run_date=None, count_text=None,
+               invites_line=None):
+    """Render the card. signups: list of {day, date, class, time} dicts.
+    count_text overrides the "N שיעורים חדשים" line; invites_line (e.g.
+    "הוזמנו 9 חברים · 81 הזמנות חדשות") adds a second line under it."""
     n = len(signups)
     row_h = 118
-    h = max(640, 400 + n * row_h + 90)
+    extra = 64 if invites_line else 0
+    h = max(640, 400 + n * row_h + 90 + extra)
     img = _lines(_gradient((W, h)))
     d = ImageDraw.Draw(img, "RGBA")
     right = W - MARGIN
@@ -168,12 +172,15 @@ def build_card(signups, out_path="card.png", run_date=None):
     _text_right(d, right - 122, 66, "נרשמת!", _font(64, bold=True), WHITE)
     _text_right(d, right, 152, "Arbox · שיעורי בוקר", _font(30, bold=True), SUB)
 
-    # ---- count line ----
-    count_text = "שיעור אחד חדש" if n == 1 else f"{n} שיעורים חדשים"
+    # ---- count line (+ optional invites line) ----
+    if count_text is None:
+        count_text = "שיעור אחד חדש" if n == 1 else f"{n} שיעורים חדשים"
     _text_right(d, right, 222, count_text, _font(34, bold=True), AMBER)
+    if invites_line:
+        _text_right(d, right, 282, invites_line, _font(30, bold=True), WHITE)
 
     # ---- signup rows ----
-    y = 300
+    y = 300 + extra
     for s in signups:
         dow = DOW_HE.get(s.get("day", ""), s.get("day", ""))
         line = f"{dow} · {_fmt_date(s.get('date', ''))} · {s.get('class', '')} · {s.get('time', '')}"
@@ -207,6 +214,8 @@ if __name__ == "__main__":
     parser.add_argument("--json", default=None, help="signup JSON array")
     parser.add_argument("--out", default="card.png")
     parser.add_argument("--run-date", default=None, help="footer stamp, e.g. 16.11.2026 15:03")
+    parser.add_argument("--count-text", default=None, help="override the count line")
+    parser.add_argument("--invites-line", default=None, help="extra line under the count, e.g. invites summary")
     parser.add_argument("--demo", action="store_true", help="render 3 sample signups")
     args = parser.parse_args()
 
@@ -218,5 +227,6 @@ if __name__ == "__main__":
         ]
         build_card(demo, out_path=args.out, run_date=args.run_date or "דוגמה")
     else:
-        build_card(_load_signups(args), out_path=args.out, run_date=args.run_date)
+        build_card(_load_signups(args), out_path=args.out, run_date=args.run_date,
+                   count_text=args.count_text, invites_line=args.invites_line)
     print(f"wrote {args.out}")
