@@ -2,7 +2,7 @@
 set -euo pipefail
 
 #=============================================================================
-# arbox-signup.sh v2.1.0 — Arbox Auto-Signup Script
+# arbox-signup.sh v2.2.0 — Arbox Auto-Signup Script
 #
 # Automatically signs up for CrossFit classes via Arbox API, up to N days
 # in advance. Sends notifications via Telegram.
@@ -12,11 +12,13 @@ set -euo pipefail
 #   ./arbox-signup.sh -e EMAIL -p PASS -h 08:00
 #   ./arbox-signup.sh --dry-run          # Preview without signing up
 #   ./arbox-signup.sh --cleanup          # Remove old CSV entries (>30 days)
+#   ./arbox-signup.sh --list-friends     # List friends from your profile
+#   ./arbox-signup.sh --invite-friend "NAME"  # Invite probe (UNVERIFIED endpoint)
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -24,15 +26,32 @@ readonly MAX_RETRIES=3
 readonly RETRY_DELAY=5
 readonly API_BASE="https://apiappv2.arboxapp.com/api/v2"
 
+# All dates/logs in Israel time (GitHub runners default to UTC).
+export TZ="Asia/Jerusalem"
+
+# Browser-impersonation headers (v2.2.0): Arbox/Cloudflare sometimes blocks
+# bare cloud IPs. Send what the real web app sends. The Safari UA below is
+# Safari 26 (macOS Tahoe) — bump it when Safari moves on. The 'version' /
+# 'referername' headers are what the app's own client sends (see the
+# saar120/arbox-automation-v2 client).
+readonly USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_26_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+readonly ARBOX_ORIGIN="https://app.arboxapp.com"
+readonly ARBOX_REFERER="https://app.arboxapp.com/"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CSV_FILE="$SCRIPT_DIR/signups.csv"
 LOG_FILE="$SCRIPT_DIR/sign.log"
 LOCK_FILE="$SCRIPT_DIR/.arbox-signup.lock"
+# curl_with_retry runs inside $(...) subshells, so the last HTTP status is
+# passed back to callers via this file (variables cannot escape a subshell).
+HTTP_STATUS_FILE="$SCRIPT_DIR/.last_http_status"
 ENV_FILE="$SCRIPT_DIR/.env"
 CACHE_FILE="$SCRIPT_DIR/.arbox_cache"
 
 DRY_RUN=false
 CLEANUP_ONLY=false
+LIST_FRIENDS=false
+INVITE_FRIEND=""
 email=""
 password=""
 signup_hour=""
@@ -79,7 +98,6 @@ load_cache() {
         BOX_ID)              [ -z "$BOX_ID" ] && BOX_ID="$value" ;;
         LOCATION_BOX_FK)     CACHED_LOCATION_BOX_FK="$value" ;;
         MEMBERSHIP_USER_ID)  CACHED_MEMBERSHIP_USER_ID="$value" ;;
-        USER_FK)             CACHED_USER_FK="$value" ;;
       esac
     done < "$CACHE_FILE"
     log_message "Loaded cached membership data from .arbox_cache"
@@ -235,28 +253,72 @@ format_date() {
   fi
 }
 
+# Last HTTP status seen by curl_with_retry (0 = no response at all).
+# Read via the file because curl_with_retry runs inside $(...) subshells.
+last_http_status() {
+  local s=""
+  s=$(cat "$HTTP_STATUS_FILE" 2>/dev/null || echo "")
+  if [ -n "$s" ]; then echo "$s"; else echo "0"; fi
+}
+
 # ── HTTP with retry ──────────────────────────────────────────────────────
+# On success prints the JSON body to stdout and returns 0. On failure logs
+# every attempt with its HTTP status + a truncated body snippet, and returns 1.
+# Contract: ANY valid-JSON body is returned (even non-2xx) — Arbox encodes
+# business errors in the body (.statusCode 512/514) and callers parse them.
+# Only empty / non-JSON responses are retried (transport failure).
+# NOTE: the body snippet is logged on failures only, truncated to 300 chars.
 curl_with_retry() {
   local method="$1" url="$2" data="${3:-}" token="${4:-}"
   local attempt=0
+  local http_code="0" body_snippet=""
+
+  printf '0' > "$HTTP_STATUS_FILE" 2>/dev/null || true
 
   while [ $attempt -lt $MAX_RETRIES ]; do
     attempt=$((attempt + 1))
-    local curl_args=(-s --max-time 30 --connect-timeout 10 -H 'Content-Type: application/json')
+    local tmp_body
+    tmp_body=$(mktemp)
+    local curl_args=(-s --max-time 30 --connect-timeout 10
+      -H 'Content-Type: application/json'
+      -H 'Accept: application/json'
+      -H "User-Agent: $USER_AGENT"
+      -H "Origin: $ARBOX_ORIGIN"
+      -H "Referer: $ARBOX_REFERER"
+      -H 'version: 11'
+      -H 'referername: app')
     [ -n "$token" ] && curl_args+=(-H "accesstoken: $token")
     if [ "$method" = "POST" ]; then
       curl_args+=(-X POST)
       [ -n "$data" ] && curl_args+=(--data-raw "$data")
     fi
 
+    # -o file + -w code keeps stdout clean (only the body is echoed on
+    # success) and gives us the real HTTP status even for empty bodies.
+    http_code=$(curl "${curl_args[@]}" -o "$tmp_body" -w '%{http_code}' "$url" 2>/dev/null) || http_code="0"
+    case "$http_code" in ''|*[!0-9]*) http_code="0" ;; esac
     local raw_response
-    raw_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null) || true
+    raw_response=$(cat "$tmp_body" 2>/dev/null || true)
+    rm -f "$tmp_body"
+    printf '%s' "$http_code" > "$HTTP_STATUS_FILE" 2>/dev/null || true
+    body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' | head -c 300)
 
     if [ -n "$raw_response" ] && echo "$raw_response" | jq empty 2>/dev/null; then
+      if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        echo "$raw_response"
+        return 0
+      fi
+      # Arbox returns business errors as non-2xx HTTP WITH a JSON body
+      # (e.g. HTTP 512 "Incorrect Login Details", HTTP 514 already signed).
+      # The body is what callers parse (.statusCode / .message / .data), so
+      # return it without retrying — retrying a definitive rejection only
+      # wastes time and hides the real reason.
+      log_message "API returned HTTP $http_code with JSON body: $method $url (body: ${body_snippet:-<empty>})"
       echo "$raw_response"
       return 0
     fi
 
+    log_message "API attempt $attempt/$MAX_RETRIES failed: $method $url (HTTP $http_code, body: ${body_snippet:-<empty>})"
     if [ $attempt -lt $MAX_RETRIES ]; then
       local wait=$((RETRY_DELAY * attempt))
       log_message "API retry $attempt/$MAX_RETRIES for $url (${wait}s)"
@@ -264,7 +326,7 @@ curl_with_retry() {
     fi
   done
 
-  log_message "ERROR: API failed after $MAX_RETRIES attempts: $method $url"
+  log_message "ERROR: API failed after $MAX_RETRIES attempts: $method $url (last HTTP $http_code, body: ${body_snippet:-<empty>})"
   return 1
 }
 
@@ -283,6 +345,25 @@ send_telegram_message() {
     --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
     --data-urlencode text="$1" \
     --max-time 10 >/dev/null 2>&1 || log_message "WARNING: Telegram send failed"
+}
+
+# ── Telegram photo ───────────────────────────────────────────────────────
+# Sends a rendered card image with a caption. Returns 0 on success.
+send_telegram_photo() {
+  local photo_path="$1" caption="$2"
+  if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+    log_message "WARNING: Telegram not configured (photo not sent)"
+    return 1
+  fi
+  if [ ! -f "$photo_path" ]; then
+    log_message "WARNING: Card image missing: $photo_path"
+    return 1
+  fi
+  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+    -F chat_id="$TELEGRAM_CHAT_ID" \
+    -F photo=@"$photo_path" \
+    -F caption="$caption" \
+    --max-time 30 >/dev/null 2>&1
 }
 
 # ── Validators ────────────────────────────────────────────────────────────
@@ -319,6 +400,10 @@ parse_args() {
       -h) signup_hour="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --cleanup) CLEANUP_ONLY=true; shift ;;
+      --list-friends) LIST_FRIENDS=true; shift ;;
+      --invite-friend)
+        if [ -z "${2:-}" ]; then echo "Error: --invite-friend needs a friend name."; exit 1; fi
+        INVITE_FRIEND="$2"; shift 2 ;;
       --version) echo "arbox-signup.sh v$VERSION"; exit 0 ;;
       --help)    show_help; exit 0 ;;
       *) echo "Unknown option: $1"; show_help; exit 1 ;;
@@ -338,6 +423,11 @@ Options:
   -h HOUR        Class time HH:MM (e.g., 08:00)
   --dry-run      Preview without signing up
   --cleanup      Remove old CSV entries and exit
+  --list-friends List friends from your Arbox profile (no signups)
+  --invite-friend NAME
+                 Invite a friend (by name, case-insensitive substring) to
+                 the next upcoming class. UNVERIFIED endpoint probe — see
+                 do_invite_friend. Manual use only, never in the daily run.
   --version      Show version
   --help         Show this help
 
@@ -346,8 +436,9 @@ Config: Create .env file (see .env.example) to avoid CLI credentials.
 EOF
 }
 
-# ── Main signup logic ─────────────────────────────────────────────────────
-do_signup() {
+# ── Shared login + membership (used by all modes) ────────────────────────
+# Sets globals ACCESS_TOKEN, LOCATION_BOX_FK, BOX_FK, MEMBERSHIP_USER_ID.
+arbox_login() {
   log_message "Logging in as $email"
   local login_payload
   login_payload=$(jq -n --arg email "$email" --arg password "$password" \
@@ -355,65 +446,283 @@ do_signup() {
   local login_response
   login_response=$(curl_with_retry POST "$API_BASE/user/login" \
     "$login_payload") || {
-    log_message "ERROR: Login request failed"
-    send_telegram_message "❌ Login request failed (network error)"
+    log_message "ERROR: Login request failed (HTTP $(last_http_status))"
+    echo "Login request failed (HTTP $(last_http_status))" >&2
+    send_telegram_message "❌ Login request failed (network error, HTTP $(last_http_status))"
     exit 1
   }
 
-  local access_token
-  access_token=$(echo "$login_response" | jq -r '.data.token // empty')
-  if [ -z "$access_token" ]; then
+  ACCESS_TOKEN=$(echo "$login_response" | jq -r '.data.token // empty')
+  if [ -z "$ACCESS_TOKEN" ]; then
     local err
-    err=$(echo "$login_response" | jq -r '.message // "Unknown error"')
-    log_message "ERROR: Login failed: $err"
-    send_telegram_message "❌ Login failed: $err"
+    # Arbox nests the reason under .error.message, not top-level .message.
+    err=$(echo "$login_response" | jq -r '.message // .error.message // "Unknown error"')
+    log_message "ERROR: Login failed (HTTP $(last_http_status)): $err"
+    echo "Login failed (HTTP $(last_http_status)): $err" >&2
+    send_telegram_message "❌ Login failed (HTTP $(last_http_status)): $err"
     exit 1
   fi
   log_message "Login successful"
+}
 
-  # Try loading membership data from cache
-  local location_box_fk="" box_fk="" membership_user_id=""
+ensure_membership() {
+  # A cache older than 7 days is ignored and re-fetched (v2.2.0): a stale
+  # membership id silently books against the wrong membership.
+  if [ -f "$CACHE_FILE" ]; then
+    local cache_mtime=0
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      cache_mtime=$(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+    else
+      cache_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+    fi
+    if [ $(( $(date +%s) - cache_mtime )) -gt $((7 * 86400)) ]; then
+      log_message "Membership cache is older than 7 days, ignoring it"
+      CACHED_LOCATION_BOX_FK=""
+      CACHED_MEMBERSHIP_USER_ID=""
+    fi
+  fi
 
   if [ -n "$CACHED_LOCATION_BOX_FK" ] && [ -n "$CACHED_MEMBERSHIP_USER_ID" ] && [ -n "$BOX_ID" ]; then
-    location_box_fk="$CACHED_LOCATION_BOX_FK"
-    box_fk="$BOX_ID"
-    membership_user_id="$CACHED_MEMBERSHIP_USER_ID"
-    log_message "Using cached membership: box=$box_fk location=$location_box_fk user=$membership_user_id"
-  else
-    # First run or cache missing — discover from API
-    log_message "No cache found, fetching membership from API..."
-
-    # If BOX_ID not set, try to discover it
-    local discover_box_id="${BOX_ID:-70}"
-    local membership_response
-    membership_response=$(curl_with_retry GET "$API_BASE/boxes/$discover_box_id/memberships/1" "" "$access_token") || {
-      log_message "ERROR: Membership request failed"
-      send_telegram_message "❌ Failed to fetch membership details"
-      exit 1
-    }
-
-    location_box_fk=$(echo "$membership_response" | jq -r '.data[0].membership_types.location_box_fk')
-    box_fk=$(echo "$membership_response" | jq -r '.data[0].box_fk')
-    membership_user_id=$(echo "$membership_response" | jq -r '.data[0].id')
-    local user_fk
-    user_fk=$(echo "$membership_response" | jq -r '.data[0].user_fk // empty')
-
-    if [ -z "$location_box_fk" ] || [ "$location_box_fk" = "null" ] || \
-       [ -z "$box_fk" ] || [ "$box_fk" = "null" ] || \
-       [ -z "$membership_user_id" ] || [ "$membership_user_id" = "null" ]; then
-      log_message "ERROR: Failed to retrieve membership details"
-      send_telegram_message "❌ Failed to retrieve membership details"
-      exit 1
-    fi
-
-    # Save to cache for next run
-    save_cache "$box_fk" "$location_box_fk" "$membership_user_id" "$user_fk"
-    BOX_ID="$box_fk"
-    log_message "Membership fetched & cached: box=$box_fk location=$location_box_fk user=$membership_user_id"
+    LOCATION_BOX_FK="$CACHED_LOCATION_BOX_FK"
+    BOX_FK="$BOX_ID"
+    MEMBERSHIP_USER_ID="$CACHED_MEMBERSHIP_USER_ID"
+    log_message "Using cached membership: box=$BOX_FK location=$LOCATION_BOX_FK user=$MEMBERSHIP_USER_ID"
+    return 0
   fi
+
+  # First run, cache missing or stale — discover from API
+  log_message "No cache found, fetching membership from API..."
+
+  # If BOX_ID not set, try to discover it
+  local discover_box_id="${BOX_ID:-70}"
+  local membership_response
+  membership_response=$(curl_with_retry GET "$API_BASE/boxes/$discover_box_id/memberships/1" "" "$ACCESS_TOKEN") || {
+    log_message "ERROR: Membership request failed (HTTP $(last_http_status))"
+    send_telegram_message "❌ Failed to fetch membership details (HTTP $(last_http_status))"
+    exit 1
+  }
+
+  LOCATION_BOX_FK=$(echo "$membership_response" | jq -r '.data[0].membership_types.location_box_fk')
+  BOX_FK=$(echo "$membership_response" | jq -r '.data[0].box_fk')
+  MEMBERSHIP_USER_ID=$(echo "$membership_response" | jq -r '.data[0].id')
+  local user_fk
+  user_fk=$(echo "$membership_response" | jq -r '.data[0].user_fk // empty')
+
+  if [ -z "$LOCATION_BOX_FK" ] || [ "$LOCATION_BOX_FK" = "null" ] || \
+     [ -z "$BOX_FK" ] || [ "$BOX_FK" = "null" ] || \
+     [ -z "$MEMBERSHIP_USER_ID" ] || [ "$MEMBERSHIP_USER_ID" = "null" ]; then
+    log_message "ERROR: Failed to retrieve membership details"
+    send_telegram_message "❌ Failed to retrieve membership details"
+    exit 1
+  fi
+
+  # Save to cache for next run
+  save_cache "$BOX_FK" "$LOCATION_BOX_FK" "$MEMBERSHIP_USER_ID" "$user_fk"
+  BOX_ID="$BOX_FK"
+  log_message "Membership fetched & cached: box=$BOX_FK location=$LOCATION_BOX_FK user=$MEMBERSHIP_USER_ID"
+}
+
+# Try the "smart" standby endpoint: it books if a spot is free, otherwise
+# waitlists. The old endpoint /scheduleUser/insertStandby was renamed by
+# Arbox on 2026-04-20 to /scheduleStandBy/insert (per the arbox-bot and
+# arbox-scheduler projects) — the old path is presumed dead; if this one
+# 404s the log will show the HTTP status.
+# Returns 0 when the user ends up booked or waitlisted, 1 otherwise.
+# Updates the do_signup counters (new_signups / new_signups_json /
+# signup_summary) through bash dynamic scope — call only from do_signup.
+try_standby() {
+  local class_id="$1" day="$2" check_date="$3" check_class_name="$4"
+  local wl_response
+  wl_response=$(curl_with_retry POST "$API_BASE/scheduleStandBy/insert" \
+    '{"schedule_id":'"$class_id"',"membership_user_id":'"$MEMBERSHIP_USER_ID"'}' \
+    "$ACCESS_TOKEN") || true
+
+  if [ -z "$wl_response" ] || ! echo "$wl_response" | jq -e '.data' >/dev/null 2>&1; then
+    log_message "Day $check_date - Standby endpoint failed (HTTP $(last_http_status))"
+    return 1
+  fi
+
+  local wl_booked wl_standby
+  wl_booked=$(echo "$wl_response" | jq -r '.data.user_booked // false')
+  wl_standby=$(echo "$wl_response" | jq -r '.data.user_in_standby // false')
+  if [ "$wl_booked" = "true" ]; then
+    add_to_csv "$check_date" "$signup_hour" "$check_class_name" "signed_up"
+    signup_summary="${signup_summary}✅ $day $check_date $check_class_name${capacity_info}\n"
+    new_signups=$((new_signups + 1))
+    new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
+    log_message "Day $check_date - Booked via standby endpoint!"
+    return 0
+  fi
+  # .data present but neither flag: legacy response shape — treat as waitlisted.
+  add_to_csv "$check_date" "$signup_hour" "$check_class_name" "waitlist"
+  signup_summary="${signup_summary}📋 $day $check_date (waitlist)${capacity_info}\n"
+  log_message "Day $check_date - Waitlisted (booked=$wl_booked standby=$wl_standby)"
+  return 0
+}
+
+# ── Friends ──────────────────────────────────────────────────────────────
+# Field names are real, from saar120/arbox-automation-v2
+# (src/types/userInfo.ts + src/arboxAPI.ts getProfile):
+#   GET /api/v2/user/profile -> .data.friend_connection[]
+#   FriendConnection { id, users_id, friend_users_id, status, user }
+#   FriendUser { id, first_name, last_name, full_name,
+#                 users_boxes_active: UsersBoxActive[] | Record }
+#   UsersBoxActive { id, box_fk, user_fk, full_name, ... }
+# users_boxes_active may be an ARRAY or an OBJECT — jq handles both below.
+fetch_profile() {
+  curl_with_retry GET "$API_BASE/user/profile" "" "$ACCESS_TOKEN"
+}
+
+print_friends() {
+  echo "$1" | jq -r '
+    (.data.friend_connection // [])[] |
+    "• \(.user.full_name) | friend_users_id=\(.friend_users_id) | status=\(.status) | connection_id=\(.id)",
+    "  boxes: \([.user.users_boxes_active | if type == "array" then .[] else to_entries[].value end | "id=\(.id) box_fk=\(.box_fk) user_fk=\(.user_fk)"] | join(", "))"'
+}
+
+do_list_friends() {
+  arbox_login
+  local profile_json
+  profile_json=$(fetch_profile) || {
+    log_message "ERROR: Failed to fetch profile (HTTP $(last_http_status))"
+    echo "Failed to fetch profile (HTTP $(last_http_status)). See sign.log."
+    exit 1
+  }
+  local count
+  count=$(echo "$profile_json" | jq -r '.data.friend_connection // [] | length')
+  echo "Friends ($count):"
+  if [ "$count" = "0" ]; then
+    echo "No friends found on your Arbox profile."
+  else
+    print_friends "$profile_json"
+  fi
+  log_message "Listed $count friends"
+}
+
+# ── Invite a friend (UNVERIFIED PROBE) ───────────────────────────────────
+# There is NO public friend-invite endpoint. This mode tries one hypothesis:
+# POST /api/v2/scheduleUser/insert with the FRIEND's membership_user_id
+# (taken from their users_boxes_active entry for our box). The server very
+# likely rejects this (the membership must belong to the token owner), so
+# expect a failure — and treat any "success" with suspicion until the
+# booking is confirmed in the Arbox app. Manual use only, never scheduled.
+# Only the NEXT upcoming 08:00 class is attempted, never the whole 12 days.
+do_invite_friend() {
+  local query="$1"
+  arbox_login
+  ensure_membership
+  local profile_json
+  profile_json=$(fetch_profile) || {
+    log_message "ERROR: Invite probe: failed to fetch profile (HTTP $(last_http_status))"
+    echo "Failed to fetch profile (HTTP $(last_http_status)). See sign.log."
+    exit 1
+  }
+
+  local q_lower
+  q_lower=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
+  local match_json
+  match_json=$(echo "$profile_json" | jq -c --arg q "$q_lower" '
+    (.data.friend_connection // []) | map(select(.user.full_name | ascii_downcase | contains($q)))')
+
+  local match_count
+  match_count=$(echo "$match_json" | jq 'length')
+  if [ "$match_count" = "0" ]; then
+    echo "No friend matching \"$query\" found. Your friends:"
+    print_friends "$profile_json"
+    log_message "Invite probe: no friend matches '$query'"
+    exit 1
+  fi
+  if [ "$match_count" != "1" ]; then
+    echo "Multiple friends match \"$query\" — be more specific:"
+    echo "$match_json" | jq -r '.[].user.full_name'
+    exit 1
+  fi
+
+  local friend_name friend_users_id friend_membership_id
+  friend_name=$(echo "$match_json" | jq -r '.[0].user.full_name')
+  friend_users_id=$(echo "$match_json" | jq -r '.[0].friend_users_id')
+  # Prefer the membership row for OUR box (same business); fall back to the
+  # first users_boxes_active entry. The id used is UsersBoxActive.id.
+  friend_membership_id=$(echo "$match_json" | jq -r --argjson box "$BOX_FK" '
+    (.[0].user.users_boxes_active | if type == "array" then . else to_entries | map(.value) end) as $boxes
+    | (($boxes | map(select(.box_fk == $box)) | .[0]) // $boxes[0]) | .id // empty')
+
+  if [ -z "$friend_membership_id" ] || [ "$friend_membership_id" = "null" ]; then
+    echo "Found $friend_name but no usable membership id (users_boxes_active is empty)."
+    log_message "Invite probe: $friend_name has no membership id"
+    exit 1
+  fi
+  echo "Invite probe (UNVERIFIED endpoint): $friend_name (friend_users_id=$friend_users_id) via membership_user_id=$friend_membership_id"
+  log_message "Invite probe: $friend_name (friend_users_id=$friend_users_id, membership_user_id=$friend_membership_id)"
+
+  # Find the next upcoming 08:00 class (skips Saturdays, respects the
+  # booking-window flag when present).
+  local class_id="" class_day="" class_date="" class_name=""
+  for days_ahead in $(seq 1 "$DAYS_AHEAD"); do
+    local check_date day check_class_name
+    check_date=$(format_date "$days_ahead" "%d-%m-%Y")
+    day=$(format_date "$days_ahead" "%A")
+    check_class_name=$(get_class_name "$day")
+    should_skip_day "$day" && continue
+    local check_schedule
+    check_schedule=$(curl_with_retry POST "$API_BASE/schedule/betweenDates" \
+      '{"from":"'"$check_date"'","to":"'"$check_date"'","locations_box_id":'"$LOCATION_BOX_FK"',"boxes_id":'"$BOX_FK"'}' \
+      "$ACCESS_TOKEN") || continue
+    local check_class
+    check_class=$(echo "$check_schedule" | jq -r '.data[] | select(.time=="'"$signup_hour"'" and .box_categories.name=="'"$check_class_name"'")')
+    [ -z "$check_class" ] || [ "$check_class" = "null" ] && continue
+    local booking_option
+    booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
+    if [ -n "$booking_option" ] && [ "$booking_option" != "registerToSchedule" ]; then
+      log_message "Invite probe: $check_date window closed (booking_option=$booking_option), trying next day"
+      continue
+    fi
+    class_id=$(echo "$check_class" | jq -r '.id')
+    class_day="$day"; class_date="$check_date"; class_name="$check_class_name"
+    break
+  done
+
+  if [ -z "$class_id" ] || [ "$class_id" = "null" ]; then
+    echo "Invite probe: no upcoming 08:00 class found in the next $DAYS_AHEAD days."
+    log_message "Invite probe: no upcoming class found"
+    exit 1
+  fi
+
+  echo "Invite probe: attempting $class_day $class_date $class_name (schedule_id=$class_id) for $friend_name..."
+  local invite_response
+  invite_response=$(curl_with_retry POST "$API_BASE/scheduleUser/insert" \
+    '{"schedule_id":'"$class_id"',"membership_user_id":'"$friend_membership_id"'}' \
+    "$ACCESS_TOKEN") || true
+
+  local status_code probe_msg
+  status_code=$(echo "$invite_response" | jq -r '.statusCode // empty' 2>/dev/null || echo "")
+  probe_msg=$(echo "$invite_response" | jq -r '.message // .error.message // empty' 2>/dev/null || echo "")
+  if [ -n "$invite_response" ] && echo "$invite_response" | jq -e '.data' >/dev/null 2>&1; then
+    echo "Invite probe: Arbox returned .data for $friend_name on $class_day $class_date — VERIFY IN THE APP that the friend is actually booked (this endpoint use is unverified)."
+    log_message "Invite probe: .data returned for $friend_name on $class_date (UNVERIFIED — verify in app)"
+    send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): $friend_name → $class_day $class_date $class_name — Arbox returned .data. Verify in the Arbox app that the friend is actually booked."
+    return 0
+  fi
+  if [ "$status_code" = "514" ]; then
+    echo "Invite probe: $friend_name is already signed up for $class_day $class_date (status 514)."
+    log_message "Invite probe: $friend_name already signed up (514) for $class_date"
+    send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): $friend_name already signed up for $class_day $class_date (514)."
+    return 0
+  fi
+  echo "Invite probe: FAILED for $friend_name on $class_day $class_date (HTTP $(last_http_status), message: ${probe_msg:-none})."
+  log_message "Invite probe: FAILED for $friend_name on $class_date (HTTP $(last_http_status), message: ${probe_msg:-none})"
+  send_telegram_message "🧪 Invite probe (UNVERIFIED endpoint): FAILED for $friend_name on $class_day $class_date (HTTP $(last_http_status))."
+  return 1
+}
+
+# ── Main signup logic ─────────────────────────────────────────────────────
+do_signup() {
+  arbox_login
+  ensure_membership
 
   local signup_summary="" errors=""
   local new_signups=0 skipped=0 already=0 failed=0
+  local new_signups_json="[]"  # JSON array for the Telegram card
   log_message "Processing next $DAYS_AHEAD days at $signup_hour (dry_run=$DRY_RUN)"
 
   for days_ahead in $(seq 1 "$DAYS_AHEAD"); do
@@ -436,9 +745,9 @@ do_signup() {
 
     local check_schedule
     check_schedule=$(curl_with_retry POST "$API_BASE/schedule/betweenDates" \
-      '{"from":"'"$check_date"'","to":"'"$check_date"'","locations_box_id":'"$location_box_fk"',"boxes_id":'"$box_fk"'}' \
-      "$access_token") || {
-      errors="${errors}❌ $day $check_date: schedule fetch failed\n"
+      '{"from":"'"$check_date"'","to":"'"$check_date"'","locations_box_id":'"$LOCATION_BOX_FK"',"boxes_id":'"$BOX_FK"'}' \
+      "$ACCESS_TOKEN") || {
+      errors="${errors}❌ $day $check_date: schedule fetch failed (HTTP $(last_http_status))\n"
       failed=$((failed + 1))
       continue
     }
@@ -465,9 +774,21 @@ do_signup() {
       continue
     fi
 
+    # Booking window (v2.2.0): Arbox marks each class with booking_option;
+    # 'registerToSchedule' means the window is open right now. Anything else
+    # means it is not open yet (or already closed) — skip WITHOUT counting
+    # it as failed. If the field is absent, proceed as before.
+    local booking_option
+    booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
+    if [ -n "$booking_option" ] && [ "$booking_option" != "registerToSchedule" ]; then
+      log_message "Day $days_ahead: $check_date - Window closed (booking_option=$booking_option), skipping"
+      continue
+    fi
+
     if $DRY_RUN; then
       signup_summary="${signup_summary}🔍 $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
+      new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
       log_message "[DRY RUN] $check_date - Would sign up"
       continue
     fi
@@ -475,9 +796,16 @@ do_signup() {
     local class_id signup_response status_code
     class_id=$(echo "$check_class" | jq -r '.id')
     signup_response=$(curl_with_retry POST "$API_BASE/scheduleUser/insert" \
-      '{"schedule_id":'"$class_id"',"membership_user_id":'"$membership_user_id"'}' \
-      "$access_token") || {
-      errors="${errors}❌ $day $check_date: signup request failed\n"
+      '{"schedule_id":'"$class_id"',"membership_user_id":'"$MEMBERSHIP_USER_ID"'}' \
+      "$ACCESS_TOKEN") || {
+      # Insert failed at the HTTP level (no JSON at all) — this used to be a
+      # dead end. The standby endpoint books if a spot is free, otherwise
+      # waitlists, so try it before giving up on the day.
+      log_message "Day $days_ahead: $check_date - Insert failed (HTTP $(last_http_status)), trying standby endpoint"
+      if try_standby "$class_id" "$day" "$check_date" "$check_class_name"; then
+        continue
+      fi
+      errors="${errors}❌ $day $check_date: signup request failed (HTTP $(last_http_status))\n"
       failed=$((failed + 1))
       continue
     }
@@ -492,31 +820,25 @@ do_signup() {
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "signed_up"
       signup_summary="${signup_summary}✅ $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
+      new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
       log_message "Day $days_ahead: $check_date - Signed up!"
     else
       local error_msg
-      error_msg=$(echo "$signup_response" | jq -r '.message // "Unknown error"')
+      error_msg=$(echo "$signup_response" | jq -r '.message // .error.message // "Unknown error"')
 
       if echo "$error_msg" | grep -qi "full\|capacity"; then
         log_message "Day $days_ahead: $check_date - Full, trying waitlist"
-        local wl_response
-        wl_response=$(curl_with_retry POST "$API_BASE/scheduleUser/insertStandby" \
-          '{"schedule_id":'"$class_id"',"membership_user_id":'"$membership_user_id"'}' \
-          "$access_token") || true
-
-        if [ -n "$wl_response" ] && echo "$wl_response" | jq -e '.data' >/dev/null 2>&1; then
-          add_to_csv "$check_date" "$signup_hour" "$check_class_name" "waitlist"
-          signup_summary="${signup_summary}📋 $day $check_date (waitlist)${capacity_info}\n"
-          log_message "Day $days_ahead: $check_date - Waitlisted"
+        if try_standby "$class_id" "$day" "$check_date" "$check_class_name"; then
+          :
         else
-          errors="${errors}❌ $day $check_date: full + waitlist failed\n"
+          errors="${errors}❌ $day $check_date: full + waitlist failed (HTTP $(last_http_status))\n"
           failed=$((failed + 1))
           log_message "Day $days_ahead: $check_date - Full, waitlist failed"
         fi
       else
-        errors="${errors}❌ $day $check_date: $error_msg\n"
+        errors="${errors}❌ $day $check_date: $error_msg (HTTP $(last_http_status))\n"
         failed=$((failed + 1))
-        log_message "Day $days_ahead: $check_date - Failed: $error_msg"
+        log_message "Day $days_ahead: $check_date - Failed: $error_msg (HTTP $(last_http_status))"
       fi
     fi
 
@@ -528,7 +850,7 @@ do_signup() {
   # Get workout
   local crossfit_workout=""
   local user_feed
-  user_feed=$(curl_with_retry GET "$API_BASE/user/feed" "" "$access_token") || true
+  user_feed=$(curl_with_retry GET "$API_BASE/user/feed" "" "$ACCESS_TOKEN") || true
 
   if [ -n "$user_feed" ]; then
     for ci in 0 1; do
@@ -566,8 +888,31 @@ do_signup() {
     [ -n "$errors" ] && msg="$msg"$'\n\n'"⚠️ Errors:"$'\n'"$(echo -e "$errors")"
     [ -n "$crossfit_workout" ] && msg="$msg"$'\n\n'"$crossfit_workout"
 
-    send_telegram_message "$msg"
-    log_message "Notification sent"
+    # Telegram photo card (v2.2.0): when there are new signups, render the
+    # card and send it as a photo with the text report as caption. Any
+    # failure falls back to the plain text message below.
+    local photo_sent=false
+    if [ $new_signups -gt 0 ] && ! $DRY_RUN; then
+      local card_path="$SCRIPT_DIR/card.png"
+      local caption="$msg"
+      # Telegram captions cap at 1024 chars — truncate, never fail the send.
+      if [ ${#caption} -gt 1000 ]; then caption="${caption:0:997}…"; fi
+      if command -v python3 >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/arbox_card.py" ] \
+         && echo "$new_signups_json" | python3 "$SCRIPT_DIR/arbox_card.py" --out "$card_path" --run-date "$(date '+%d.%m.%Y %H:%M')" 2>/dev/null; then
+        if send_telegram_photo "$card_path" "$caption"; then
+          photo_sent=true
+          log_message "Card photo sent"
+        else
+          log_message "WARNING: sendPhoto failed, falling back to text"
+        fi
+      else
+        log_message "WARNING: Card render failed, falling back to text"
+      fi
+    fi
+    if ! $photo_sent; then
+      send_telegram_message "$msg"
+      log_message "Notification sent"
+    fi
   else
     if [ -n "$crossfit_workout" ]; then
       send_telegram_message "${prefix}${crossfit_workout}"
@@ -597,10 +942,20 @@ main() {
 
   validate_hour "$signup_hour"
 
+  # Manual modes (never part of the scheduled run): no lock, no CSV.
+  if $LIST_FRIENDS; then
+    do_list_friends
+    exit 0
+  fi
+
+  if [ -n "$INVITE_FRIEND" ]; then
+    do_invite_friend "$INVITE_FRIEND"
+    exit $?
+  fi
+
   # Load cached membership data (BOX_ID, location, user)
   CACHED_LOCATION_BOX_FK=""
   CACHED_MEMBERSHIP_USER_ID=""
-  CACHED_USER_FK=""
   load_cache || true
 
   rotate_log
