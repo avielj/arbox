@@ -20,7 +20,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.3.0"
+readonly VERSION="2.3.1"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -892,7 +892,7 @@ send_invite() {
 # globals + INVITE_SUMMARY for the combined report.
 invite_friends_to_classes() {
   INVITES_NEW=0; INVITES_SKIPPED=0; INVITES_FAILED=0
-  INVITE_SUMMARY=""; INVITE_FRIENDS_COUNT=0
+  INVITE_SUMMARY=""; INVITE_EXCEPTIONS=""; INVITE_FRIENDS_COUNT=0
   arbox_login
   local profile_json
   profile_json=$(fetch_profile) || {
@@ -956,6 +956,12 @@ invite_friends_to_classes() {
     INVITES_SKIPPED=$((INVITES_SKIPPED + class_skipped))
     INVITES_FAILED=$((INVITES_FAILED + class_failed))
     INVITE_SUMMARY="${INVITE_SUMMARY}📅 $cday $cdate $cname: $class_new invited, $class_skipped already, $class_failed failed\n"
+    # The Telegram caption stays short: per-class lines only for classes
+    # where something was skipped or failed (v2.3.1 — the full per-class
+    # list made the message too long when every class was identical).
+    if [ "$class_skipped" -gt 0 ] || [ "$class_failed" -gt 0 ]; then
+      INVITE_EXCEPTIONS="${INVITE_EXCEPTIONS}📅 $cday $cdate $cname: $class_new invited, $class_skipped already, $class_failed failed\n"
+    fi
   done
   log_message "Invite-all done: new=$INVITES_NEW already=$INVITES_SKIPPED failed=$INVITES_FAILED"
 }
@@ -971,9 +977,13 @@ send_invite_all_report() {
   msg="$msg"$'\n'"📊 Signup: New $INVITE_ALL_NEW | ✅ Already $INVITE_ALL_ALREADY | ❌ Failed $INVITE_ALL_FAILED"
   msg="$msg"$'\n'"📨 Invites: $INVITES_NEW new | ⏭️ $INVITES_SKIPPED already sent | ❌ $INVITES_FAILED failed"
   if [ "$n_classes" -gt 0 ]; then
-    msg="$msg"$'\n\n'"✨ My classes:"$'\n'"$(echo "$SIGNED_UP_CLASSES_JSON" | jq -r '.[] | "📅 \(.day) \(.date) \(.class)"')"
+    # Compact one-line date list (v2.3.1 — the full per-class list made the
+    # caption too long); the photo card shows the classes in full.
+    local class_dates
+    class_dates=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -r '[.[] | (.date | split("-") | .[0] + "." + .[1])] | join(", ")')
+    msg="$msg"$'\n'"📅 Classes: $class_dates"
   fi
-  [ -n "$INVITE_SUMMARY" ] && msg="$msg"$'\n\n'"📨 Invites per class:"$'\n'"$(echo -e "$INVITE_SUMMARY")"
+  [ -n "$INVITE_EXCEPTIONS" ] && msg="$msg"$'\n\n'"⚠️ Invite exceptions:"$'\n'"$(echo -e "$INVITE_EXCEPTIONS")"
   [ -n "$INVITE_ALL_ERRORS" ] && msg="$msg"$'\n\n'"⚠️ Errors:"$'\n'"$(echo -e "$INVITE_ALL_ERRORS")"
   [ -n "$INVITE_ALL_WORKOUT" ] && msg="$msg"$'\n\n'"$INVITE_ALL_WORKOUT"
 
