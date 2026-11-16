@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.3"
+readonly VERSION="2.2.4"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -951,6 +951,15 @@ main() {
 
   validate_hour "$signup_hour"
 
+  # Load cached membership data (BOX_ID, location, user) BEFORE the manual
+  # modes: do_invite_friend calls ensure_membership, which reads
+  # CACHED_LOCATION_BOX_FK under `set -u` — v2.2.3 initialised these only
+  # on the signup path, so --invite-friend crashed with "unbound variable"
+  # (run #226) before reaching the server.
+  CACHED_LOCATION_BOX_FK=""
+  CACHED_MEMBERSHIP_USER_ID=""
+  load_cache || true
+
   # Manual modes (never part of the scheduled run): no lock, no CSV.
   if $LIST_FRIENDS; then
     do_list_friends
@@ -961,11 +970,6 @@ main() {
     do_invite_friend "$INVITE_FRIEND"
     exit $?
   fi
-
-  # Load cached membership data (BOX_ID, location, user)
-  CACHED_LOCATION_BOX_FK=""
-  CACHED_MEMBERSHIP_USER_ID=""
-  load_cache || true
 
   rotate_log
 
