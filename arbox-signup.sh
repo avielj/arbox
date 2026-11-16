@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.7"
+readonly VERSION="2.2.8"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -302,6 +302,16 @@ curl_with_retry() {
     rm -f "$tmp_body"
     printf '%s' "$http_code" > "$HTTP_STATUS_FILE" 2>/dev/null || true
     body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' 2>/dev/null | head -c 300 || true)
+
+    # Plain-text "OK" with 2xx is also a success: the invite endpoint
+    # (userToUser/schedule/invite) answers HTTP 200 with body "OK", not
+    # JSON (live run #229, Nov 16 2026 — the script retried it 3 times
+    # before this was fixed). The app's own wrapper treats a response of
+    # true or "OK" as success.
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ] && [ "$(printf '%s' "$raw_response" | tr -d '[:space:]')" = "OK" ]; then
+      echo "$raw_response"
+      return 0
+    fi
 
     if [ -n "$raw_response" ] && echo "$raw_response" | jq empty 2>/dev/null; then
       if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
@@ -618,8 +628,10 @@ do_list_friends() {
 # and joins by booking the class themselves — the app never books on
 # another user's behalf, and there is no accept endpoint in the bundle.
 # Manual use only, never scheduled. Only the NEXT upcoming 08:00 class is
-# attempted, never the whole 12 days. First live call of this endpoint is
-# still unproven — verify in the app that the friend got the invite.
+# attempted, never the whole 12 days. Live-proven Nov 16 2026 (run #229):
+# the server answers HTTP 200 with body "OK" — verify in the app that the
+# friend shows as invited (the first live run sent the POST 3 times before
+# the plain-text-OK fix, so check for duplicates too).
 do_invite_friend() {
   local query="$1"
   arbox_login
@@ -720,9 +732,11 @@ do_invite_friend() {
   invite_data=$(echo "$invite_response" | jq -r '.data // empty' 2>/dev/null || echo "")
   status_code=$(echo "$invite_response" | jq -r '.statusCode // empty' 2>/dev/null || echo "")
   probe_msg=$(echo "$invite_response" | jq -r '.message // .error.message // empty' 2>/dev/null || echo "")
-  # Per the app bundle: success iff .data is true or "OK". The friend then
-  # sees an invitation card and joins by booking the class themselves.
-  if [ "$invite_data" = "true" ] || [ "$invite_data" = "OK" ]; then
+  # Per the app bundle: success iff the response is true or "OK" — the
+  # server answers HTTP 200 with a plain-text "OK" body (not JSON), so
+  # accept the raw body too. The friend then sees an invitation card and
+  # joins by booking the class themselves.
+  if [ "$invite_data" = "true" ] || [ "$invite_data" = "OK" ] || [ "$(printf '%s' "$invite_response" | tr -d '[:space:]')" = "OK" ]; then
     echo "Invite: $friend_name invited to $class_day $class_date — they must approve in the Arbox app to join."
     log_message "Invite: $friend_name invited to $class_date (data=$invite_data)"
     send_telegram_message "📨 Invite sent: $friend_name → $class_day $class_date $class_name. They need to approve in the Arbox app."
