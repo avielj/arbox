@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.0"
+readonly VERSION="2.2.1"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -574,10 +574,19 @@ fetch_profile() {
 }
 
 print_friends() {
+  # Null-tolerant (v2.2.1): some connections come back with .user == null
+  # (deleted/deactivated account) or a null full_name — either used to kill
+  # the whole listing with `jq: null has no keys`. Name falls back to
+  # first+last, then to "unknown"; boxes fall back to an empty list.
   echo "$1" | jq -r '
+    def display_name:
+      ((.user.full_name // (((.user.first_name // "") + " " + (.user.last_name // "")) | sub("^ +$"; "") | sub("^ +"; "") | sub(" +$"; ""))) // "unknown")
+      | if . == "" then "unknown" else . end;
+    def boxes:
+      ((.user.users_boxes_active // []) | if type == "array" then . else to_entries | map(.value) end);
     (.data.friend_connection // [])[] |
-    "• \(.user.full_name) | friend_users_id=\(.friend_users_id) | status=\(.status) | connection_id=\(.id)",
-    "  boxes: \([.user.users_boxes_active | if type == "array" then .[] else to_entries[].value end | "id=\(.id) box_fk=\(.box_fk) user_fk=\(.user_fk)"] | join(", "))"'
+    "• \(display_name) | friend_users_id=\(.friend_users_id) | status=\(.status) | connection_id=\(.id)",
+    "  boxes: \([boxes[] | "id=\(.id) box_fk=\(.box_fk) user_fk=\(.user_fk)"] | join(", "))"'
 }
 
 do_list_friends() {
@@ -622,7 +631,7 @@ do_invite_friend() {
   q_lower=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
   local match_json
   match_json=$(echo "$profile_json" | jq -c --arg q "$q_lower" '
-    (.data.friend_connection // []) | map(select(.user.full_name | ascii_downcase | contains($q)))')
+    (.data.friend_connection // []) | map(select(((.user.full_name // "") | ascii_downcase | contains($q))))')
 
   local match_count
   match_count=$(echo "$match_json" | jq 'length')
@@ -634,17 +643,17 @@ do_invite_friend() {
   fi
   if [ "$match_count" != "1" ]; then
     echo "Multiple friends match \"$query\" — be more specific:"
-    echo "$match_json" | jq -r '.[].user.full_name'
+    echo "$match_json" | jq -r '.[] | (.user.full_name // "unknown")'
     exit 1
   fi
 
   local friend_name friend_users_id friend_membership_id
-  friend_name=$(echo "$match_json" | jq -r '.[0].user.full_name')
+  friend_name=$(echo "$match_json" | jq -r '.[0].user.full_name // "unknown"')
   friend_users_id=$(echo "$match_json" | jq -r '.[0].friend_users_id')
   # Prefer the membership row for OUR box (same business); fall back to the
   # first users_boxes_active entry. The id used is UsersBoxActive.id.
   friend_membership_id=$(echo "$match_json" | jq -r --argjson box "$BOX_FK" '
-    (.[0].user.users_boxes_active | if type == "array" then . else to_entries | map(.value) end) as $boxes
+    ((.[0].user.users_boxes_active // []) | if type == "array" then . else to_entries | map(.value) end) as $boxes
     | (($boxes | map(select(.box_fk == $box)) | .[0]) // $boxes[0]) | .id // empty')
 
   if [ -z "$friend_membership_id" ] || [ "$friend_membership_id" = "null" ]; then
