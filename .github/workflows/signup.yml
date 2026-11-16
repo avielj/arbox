@@ -21,6 +21,7 @@ on:
           - list-friends
           - invite-friend
           - check-invite
+                    - invite-all
       friend_name:
         description: 'Friend full name (invite-friend only)'
         required: false
@@ -110,6 +111,7 @@ jobs:
           path: |
             .arbox_cache
             signups.csv
+            invites.csv
           key: arbox-cache-${{ secrets.ARBOX_EMAIL }}
 
       - name: 🏋️ Run signup script
@@ -130,6 +132,9 @@ jobs:
               check-invite)
               ARGS+=(--check-invite "${{ inputs.friend_name }}")
               ;;
+          invite-all)
+            ARGS+=(--invite-all)
+            ;;
             *)
               ;;
           esac
