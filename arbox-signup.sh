@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.1"
+readonly VERSION="2.2.2"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -600,6 +600,11 @@ do_list_friends() {
   local count
   count=$(echo "$profile_json" | jq -r '.data.friend_connection // [] | length')
   echo "Friends ($count):"
+  # Debug (v2.2.2): the live API returns .user == null for every friend, so
+  # no names print. Dump the real keys of the first entry so the mapping
+  # can be fixed to whatever the API actually returns. Remove once mapped.
+  echo "DEBUG first entry keys: $(echo "$profile_json" | jq -c '.data.friend_connection[0] | keys')"
+  echo "DEBUG first entry: $(echo "$profile_json" | jq -c '.data.friend_connection[0]')"
   if [ "$count" = "0" ]; then
     echo "No friends found on your Arbox profile."
   else
