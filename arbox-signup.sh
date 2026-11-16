@@ -14,11 +14,12 @@ set -euo pipefail
 #   ./arbox-signup.sh --cleanup          # Remove old CSV entries (>30 days)
 #   ./arbox-signup.sh --list-friends     # List friends from your profile
 #   ./arbox-signup.sh --invite-friend "NAME"  # Invite a friend (POST userToUser/schedule/invite)
+#   ./arbox-signup.sh --check-invite "NAME"   # Check invite status (POST friendConnection/schedule)
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.8"
+readonly VERSION="2.2.9"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -52,6 +53,7 @@ DRY_RUN=false
 CLEANUP_ONLY=false
 LIST_FRIENDS=false
 INVITE_FRIEND=""
+CHECK_INVITE=""
 email=""
 password=""
 signup_hour=""
@@ -414,6 +416,9 @@ parse_args() {
       --invite-friend)
         if [ -z "${2:-}" ]; then echo "Error: --invite-friend needs a friend name."; exit 1; fi
         INVITE_FRIEND="$2"; shift 2 ;;
+      --check-invite)
+        if [ -z "${2:-}" ]; then echo "Error: --check-invite needs a friend name."; exit 1; fi
+        CHECK_INVITE="$2"; shift 2 ;;
       --version) echo "arbox-signup.sh v$VERSION"; exit 0 ;;
       --help)    show_help; exit 0 ;;
       *) echo "Unknown option: $1"; show_help; exit 1 ;;
@@ -440,6 +445,10 @@ Options:
                  (endpoint from the Arbox web-app bundle). The friend must
                  approve in the app to join. Manual use only, never in the
                  daily run.
+  --check-invite NAME
+                 Ask the server for a friend's invite status:
+                 POST friendConnection/schedule. Sends nothing, invites
+                 nobody. Manual use only, never in the daily run.
   --version      Show version
   --help         Show this help
 
@@ -748,6 +757,78 @@ do_invite_friend() {
   return 1
 }
 
+# ── Check invite status ──────────────────────────────────────────────────
+# The app UI shows NO indication that an invite was sent: the BookClass
+# modal recomputes every friend's invite_status from the class's booked
+# users ("booked" or "invite") every time it opens, discarding any stored
+# "invited" value — and "invited" only exists in memory right after you
+# tap invite in that same session (app bundle, Nov 16 2026). So this mode
+# asks the server directly: POST friendConnection/schedule {users_ids:[...]}
+# returns the friend connections, which MAY carry the stored invite_status.
+# Prints the full raw response so the real shape is visible either way.
+# Manual use only, never in the daily run. Sends nothing, invites nobody.
+do_check_invite() {
+  local query="$1"
+  arbox_login
+  local profile_json
+  profile_json=$(fetch_profile) || {
+    log_message "ERROR: Check invite: failed to fetch profile (HTTP $(last_http_status))"
+    echo "Failed to fetch profile (HTTP $(last_http_status)). See sign.log."
+    exit 1
+  }
+
+  local q_lower
+  q_lower=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
+  local match_json
+  match_json=$(echo "$profile_json" | jq -c --arg q "$q_lower" '
+    (.data.friend_connection // []) | map(select(((.friend_user.full_name // "") | ascii_downcase | contains($q))))')
+
+  local match_count
+  match_count=$(echo "$match_json" | jq 'length')
+  if [ "$match_count" = "0" ]; then
+    echo "No friend matching \"$query\" found. Your friends:"
+    print_friends "$profile_json"
+    log_message "Check invite: no friend matches '$query'"
+    exit 1
+  fi
+  if [ "$match_count" != "1" ]; then
+    echo "Multiple friends match \"$query\" — be more specific:"
+    echo "$match_json" | jq -r '.[] | (.friend_user.full_name // "unknown")'
+    exit 1
+  fi
+
+  local friend_name friend_users_id
+  friend_name=$(echo "$match_json" | jq -r '.[0].friend_user.full_name // "unknown"')
+  friend_users_id=$(echo "$match_json" | jq -r '.[0].friend_users_id')
+  echo "Check invite: $friend_name (friend_users_id=$friend_users_id) via POST friendConnection/schedule"
+  log_message "Check invite: $friend_name (friend_users_id=$friend_users_id)"
+
+  local check_response
+  check_response=$(curl_with_retry POST "$API_BASE/friendConnection/schedule" \
+    '{"users_ids":['"$friend_users_id"']}' \
+    "$ACCESS_TOKEN") || {
+    log_message "Check invite: friendConnection/schedule failed (HTTP $(last_http_status))"
+    echo "Request failed (HTTP $(last_http_status)). See sign.log."
+    exit 1
+  }
+
+  echo "--- raw friendConnection/schedule response ---"
+  echo "$check_response" | jq . 2>/dev/null || echo "$check_response"
+  log_message "Check invite: raw response: $(printf '%s' "$check_response" | tr '\n' ' ' 2>/dev/null | head -c 1000 || true)"
+
+  local invite_status
+  invite_status=$(echo "$check_response" | jq -r --argjson fid "$friend_users_id" '
+    ((.data // []) | if type == "array" then map(select(.friend_users_id == $fid or .users_id == $fid)) | .[0].invite_status // empty else .invite_status // empty end)' 2>/dev/null || echo "")
+  if [ -n "$invite_status" ]; then
+    echo "Check invite: $friend_name invite_status = $invite_status"
+    log_message "Check invite: $friend_name invite_status=$invite_status"
+  else
+    echo "Check invite: no invite_status in the response for $friend_name (see raw response above)."
+    log_message "Check invite: no invite_status for $friend_name"
+  fi
+  return 0
+}
+
 # ── Main signup logic ─────────────────────────────────────────────────────
 do_signup() {
   arbox_login
@@ -1021,6 +1102,11 @@ main() {
 
   if [ -n "$INVITE_FRIEND" ]; then
     do_invite_friend "$INVITE_FRIEND"
+    exit $?
+  fi
+
+  if [ -n "$CHECK_INVITE" ]; then
+    do_check_invite "$CHECK_INVITE"
     exit $?
   fi
 
