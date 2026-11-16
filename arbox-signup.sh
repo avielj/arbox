@@ -15,11 +15,12 @@ set -euo pipefail
 #   ./arbox-signup.sh --list-friends     # List friends from your profile
 #   ./arbox-signup.sh --invite-friend "NAME"  # Invite a friend (POST userToUser/schedule/invite)
 #   ./arbox-signup.sh --check-invite "NAME"   # Check invite status (POST friendConnection/schedule)
+#   ./arbox-signup.sh --invite-all            # Full run: signup 12 days + invite all friends to my classes
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.9"
+readonly VERSION="2.3.0"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -41,6 +42,7 @@ readonly ARBOX_REFERER="https://app.arboxapp.com/"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CSV_FILE="$SCRIPT_DIR/signups.csv"
+INVITES_FILE="$SCRIPT_DIR/invites.csv"
 LOG_FILE="$SCRIPT_DIR/sign.log"
 LOCK_FILE="$SCRIPT_DIR/.arbox-signup.lock"
 # curl_with_retry runs inside $(...) subshells, so the last HTTP status is
@@ -54,6 +56,10 @@ CLEANUP_ONLY=false
 LIST_FRIENDS=false
 INVITE_FRIEND=""
 CHECK_INVITE=""
+INVITE_ALL=false
+# Classes Aviel is signed up for (JSON array of {schedule_id, day, date,
+# class, time}) — collected by do_signup for the invite-all phase.
+SIGNED_UP_CLASSES_JSON="[]"
 email=""
 password=""
 signup_hour=""
@@ -246,6 +252,33 @@ add_to_csv() {
   echo "$1,$2,$3,$4,$(date '+%Y-%m-%d %H:%M:%S')" >> "$CSV_FILE"
 }
 
+# ── Invites ledger (dedupe) ──────────────────────────────────────────────
+# invites.csv columns: schedule_id,friend_users_id,date,friend_name,status,timestamp
+# A (schedule_id, friend) pair with status=invited is NEVER invited again —
+# if we invited today, tomorrow's run skips that class for that friend
+# ("no need to pester"). Failed rows are retried on the next run.
+# NOTE: for the dedupe to survive on ephemeral GitHub runners, invites.csv
+# must be in the workflow cache (same as signups.csv).
+is_invited() {
+  [ -f "$INVITES_FILE" ] && awk -F, -v s="$1" -v f="$2" '$1==s && $2==f && $5=="invited" {found=1} END{exit !found}' "$INVITES_FILE"
+}
+
+add_to_invites() {
+  echo "$1,$2,$3,$4,$5,$(date '+%Y-%m-%d %H:%M:%S')" >> "$INVITES_FILE"
+}
+
+# Record a class Aviel is signed up for (for the invite-all phase).
+# schedule_id is numeric — passed with --argjson. Never aborts the run:
+# on any jq failure it logs a warning and returns 0.
+note_signed_up_class() {
+  local updated
+  updated=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -c --argjson sid "$1" --arg day "$2" --arg date "$3" --arg cls "$4" --arg time "$5" '. + [{schedule_id:$sid, day:$day, date:$date, class:$cls, time:$time}]' 2>/dev/null) || {
+    log_message "WARNING: note_signed_up_class failed (schedule $1)"
+    return 0
+  }
+  SIGNED_UP_CLASSES_JSON="$updated"
+}
+
 # ── Date (cross-platform) ────────────────────────────────────────────────
 format_date() {
   if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -419,6 +452,7 @@ parse_args() {
       --check-invite)
         if [ -z "${2:-}" ]; then echo "Error: --check-invite needs a friend name."; exit 1; fi
         CHECK_INVITE="$2"; shift 2 ;;
+      --invite-all) INVITE_ALL=true; shift ;;
       --version) echo "arbox-signup.sh v$VERSION"; exit 0 ;;
       --help)    show_help; exit 0 ;;
       *) echo "Unknown option: $1"; show_help; exit 1 ;;
@@ -449,6 +483,11 @@ Options:
                  Ask the server for a friend's invite status:
                  POST friendConnection/schedule. Sends nothing, invites
                  nobody. Manual use only, never in the daily run.
+  --invite-all   Full run: sign up for the next 12 days, then invite ALL
+                 friends to every class you are signed up for. Sent invites
+                 are recorded in invites.csv and never re-sent to the same
+                 class. One combined Telegram card at the end. Manual use
+                 only, never in the daily run.
   --version      Show version
   --help         Show this help
 
@@ -568,6 +607,7 @@ try_standby() {
   wl_standby=$(echo "$wl_response" | jq -r '.data.user_in_standby // false')
   if [ "$wl_booked" = "true" ]; then
     add_to_csv "$check_date" "$signup_hour" "$check_class_name" "signed_up"
+    note_signed_up_class "$class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
     signup_summary="${signup_summary}✅ $day $check_date $check_class_name${capacity_info}\n"
     new_signups=$((new_signups + 1))
     new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
@@ -829,6 +869,138 @@ do_check_invite() {
   return 0
 }
 
+# ── Invite all friends to all my classes ─────────────────────────────────
+# One invite POST. Returns 0 iff the server accepted it (HTTP 2xx with a
+# plain-text "OK" body, or JSON .data true/"OK" — the app's own success
+# check). Prints nothing.
+send_invite() {
+  local sid="$1" fid="$2"
+  local resp data
+  resp=$(curl_with_retry POST "$API_BASE/userToUser/schedule/invite" \
+    '{"schedule_id":'"$sid"',"friend_users_id":'"$fid"'}' \
+    "$ACCESS_TOKEN") || return 1
+  data=$(echo "$resp" | jq -r '.data // empty' 2>/dev/null || echo "")
+  if [ "$data" = "true" ] || [ "$data" = "OK" ] || [ "$(printf '%s' "$resp" | tr -d '[:space:]')" = "OK" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Manual mode (--invite-all): after do_signup, invite EVERY friend to EVERY
+# class in SIGNED_UP_CLASSES_JSON. Dedupe via invites.csv: a friend invited
+# to a class once is never invited to that class again. Sets the INVITES_*
+# globals + INVITE_SUMMARY for the combined report.
+invite_friends_to_classes() {
+  INVITES_NEW=0; INVITES_SKIPPED=0; INVITES_FAILED=0
+  INVITE_SUMMARY=""; INVITE_FRIENDS_COUNT=0
+  arbox_login
+  local profile_json
+  profile_json=$(fetch_profile) || {
+    log_message "ERROR: Invite-all: failed to fetch profile (HTTP $(last_http_status))"
+    echo "Failed to fetch profile (HTTP $(last_http_status)). See sign.log."
+    return 1
+  }
+  local friends_json
+  friends_json=$(echo "$profile_json" | jq -c '[.data.friend_connection // [] | .[] | {name: (.friend_user.full_name // "unknown"), id: .friend_users_id}]')
+  local n_friends
+  n_friends=$(echo "$friends_json" | jq 'length')
+  local n_classes
+  n_classes=$(echo "$SIGNED_UP_CLASSES_JSON" | jq 'length')
+  if [ "$n_classes" = "0" ]; then
+    log_message "Invite-all: no signed-up classes in the next $DAYS_AHEAD days, nothing to invite to"
+    echo "No signed-up classes found — nothing to invite to."
+    return 0
+  fi
+  if [ "$n_friends" = "0" ]; then
+    log_message "Invite-all: no friends on the profile"
+    echo "No friends found on your Arbox profile."
+    return 0
+  fi
+  INVITE_FRIENDS_COUNT=$n_friends
+  log_message "Invite-all: $n_friends friends x $n_classes classes"
+  local i j
+  for ((i=0; i<n_classes; i++)); do
+    local cls sid cday cdate cname
+    cls=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -c ".[$i]")
+    sid=$(echo "$cls" | jq -r '.schedule_id')
+    cday=$(echo "$cls" | jq -r '.day')
+    cdate=$(echo "$cls" | jq -r '.date')
+    cname=$(echo "$cls" | jq -r '.class')
+    local class_new=0 class_skipped=0 class_failed=0
+    for ((j=0; j<n_friends; j++)); do
+      local fr fname fid
+      fr=$(echo "$friends_json" | jq -c ".[$j]")
+      fname=$(echo "$fr" | jq -r '.name')
+      fid=$(echo "$fr" | jq -r '.id')
+      if is_invited "$sid" "$fid"; then
+        class_skipped=$((class_skipped + 1))
+        continue
+      fi
+      if $DRY_RUN; then
+        log_message "[DRY RUN] Invite-all: would invite $fname to $cdate"
+        class_new=$((class_new + 1))
+        continue
+      fi
+      if send_invite "$sid" "$fid"; then
+        add_to_invites "$sid" "$fid" "$cdate" "$fname" "invited"
+        class_new=$((class_new + 1))
+        log_message "Invite-all: invited $fname to $cdate (schedule $sid)"
+      else
+        add_to_invites "$sid" "$fid" "$cdate" "$fname" "failed"
+        class_failed=$((class_failed + 1))
+        log_message "Invite-all: FAILED to invite $fname to $cdate (HTTP $(last_http_status))"
+      fi
+      sleep 0.3
+    done
+    INVITES_NEW=$((INVITES_NEW + class_new))
+    INVITES_SKIPPED=$((INVITES_SKIPPED + class_skipped))
+    INVITES_FAILED=$((INVITES_FAILED + class_failed))
+    INVITE_SUMMARY="${INVITE_SUMMARY}📅 $cday $cdate $cname: $class_new invited, $class_skipped already, $class_failed failed\n"
+  done
+  log_message "Invite-all done: new=$INVITES_NEW already=$INVITES_SKIPPED failed=$INVITES_FAILED"
+}
+
+# One combined Telegram report for the invite-all run: the card shows the
+# signed-up classes, the caption carries signup + invite counts.
+send_invite_all_report() {
+  local prefix=""
+  $DRY_RUN && prefix="[DRY RUN] "
+  local n_classes
+  n_classes=$(echo "$SIGNED_UP_CLASSES_JSON" | jq 'length')
+  local msg="${prefix}🏋️ Arbox Full Run — $signup_hour"
+  msg="$msg"$'\n'"📊 Signup: New $INVITE_ALL_NEW | ✅ Already $INVITE_ALL_ALREADY | ❌ Failed $INVITE_ALL_FAILED"
+  msg="$msg"$'\n'"📨 Invites: $INVITES_NEW new | ⏭️ $INVITES_SKIPPED already sent | ❌ $INVITES_FAILED failed"
+  if [ "$n_classes" -gt 0 ]; then
+    msg="$msg"$'\n\n'"✨ My classes:"$'\n'"$(echo "$SIGNED_UP_CLASSES_JSON" | jq -r '.[] | "📅 \(.day) \(.date) \(.class)"')"
+  fi
+  [ -n "$INVITE_SUMMARY" ] && msg="$msg"$'\n\n'"📨 Invites per class:"$'\n'"$(echo -e "$INVITE_SUMMARY")"
+  [ -n "$INVITE_ALL_ERRORS" ] && msg="$msg"$'\n\n'"⚠️ Errors:"$'\n'"$(echo -e "$INVITE_ALL_ERRORS")"
+  [ -n "$INVITE_ALL_WORKOUT" ] && msg="$msg"$'\n\n'"$INVITE_ALL_WORKOUT"
+
+  local photo_sent=false
+  if [ "$n_classes" -gt 0 ] && ! $DRY_RUN; then
+    local card_path="$SCRIPT_DIR/card.png"
+    local caption="$msg"
+    # Telegram captions cap at 1024 chars — truncate, never fail the send.
+    if [ ${#caption} -gt 1000 ]; then caption="${caption:0:997}…"; fi
+    if command -v python3 >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/arbox_card.py" ] \
+       && echo "$SIGNED_UP_CLASSES_JSON" | python3 "$SCRIPT_DIR/arbox_card.py" --out "$card_path" --run-date "$(date '+%d.%m.%Y %H:%M')" --count-text "$n_classes שיעורים" --invites-line "הוזמנו $INVITE_FRIENDS_COUNT חברים · $INVITES_NEW הזמנות חדשות" 2>/dev/null; then
+      if send_telegram_photo "$card_path" "$caption"; then
+        photo_sent=true
+        log_message "Invite-all card photo sent"
+      else
+        log_message "WARNING: sendPhoto failed, falling back to text"
+      fi
+    else
+      log_message "WARNING: Card render failed, falling back to text"
+    fi
+  fi
+  if ! $photo_sent; then
+    send_telegram_message "$msg"
+    log_message "Invite-all text notification sent"
+  fi
+}
+
 # ── Main signup logic ─────────────────────────────────────────────────────
 do_signup() {
   arbox_login
@@ -837,6 +1009,7 @@ do_signup() {
   local signup_summary="" errors=""
   local new_signups=0 skipped=0 already=0 failed=0
   local new_signups_json="[]"  # JSON array for the Telegram card
+  SIGNED_UP_CLASSES_JSON="[]"  # reset: classes Aviel is signed up for
   log_message "Processing next $DAYS_AHEAD days at $signup_hour (dry_run=$DRY_RUN)"
 
   for days_ahead in $(seq 1 "$DAYS_AHEAD"); do
@@ -878,11 +1051,14 @@ do_signup() {
     registered=$(echo "$check_class" | jq -r '.registeredUsers // 0')
     max_users=$(echo "$check_class" | jq -r '.maxUsers // 0')
     [ "$max_users" != "0" ] && [ "$max_users" != "null" ] && capacity_info=" ($registered/$max_users)"
+    local loop_class_id
+    loop_class_id=$(echo "$check_class" | jq -r '.id')
 
     local is_signed_up
     is_signed_up=$(echo "$check_class" | jq -r '.isSignedUp')
     if [ "$is_signed_up" = "true" ]; then
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "already_signed_up"
+      note_signed_up_class "$loop_class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
       already=$((already + 1))
       log_message "Day $days_ahead: $check_date - Already signed up"
       continue
@@ -901,6 +1077,7 @@ do_signup() {
     booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
     if [ "$booking_option" = "cancelScheduleUser" ]; then
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "already_signed_up"
+      note_signed_up_class "$loop_class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
       already=$((already + 1))
       log_message "Day $days_ahead: $check_date - Already signed up (booking_option=cancelScheduleUser)"
       continue
@@ -932,6 +1109,7 @@ do_signup() {
       signup_summary="${signup_summary}🔍 $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
       new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
+      note_signed_up_class "$loop_class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
       log_message "[DRY RUN] $check_date - Would sign up"
       continue
     fi
@@ -957,10 +1135,12 @@ do_signup() {
 
     if [ "$status_code" = "514" ]; then
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "already_signed_up"
+      note_signed_up_class "$class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
       already=$((already + 1))
       log_message "Day $days_ahead: $check_date - Already signed (514)"
     elif echo "$signup_response" | jq -e '.data' >/dev/null 2>&1; then
       add_to_csv "$check_date" "$signup_hour" "$check_class_name" "signed_up"
+      note_signed_up_class "$class_id" "$day" "$check_date" "$check_class_name" "$signup_hour"
       signup_summary="${signup_summary}✅ $day $check_date $check_class_name${capacity_info}\n"
       new_signups=$((new_signups + 1))
       new_signups_json=$(echo "$new_signups_json" | jq -c --arg day "$day" --arg date "$check_date" --arg cls "$check_class_name" --arg time "$signup_hour" '. + [{day:$day, date:$date, class:$cls, time:$time}]')
@@ -1020,6 +1200,19 @@ do_signup() {
   fi
 
   # Notification
+  # Invite-all mode: the combined report (signup + invites) is sent by the
+  # caller, so export the summary and skip this notification.
+  if $INVITE_ALL; then
+    INVITE_ALL_NEW=$new_signups
+    INVITE_ALL_ALREADY=$already
+    INVITE_ALL_SKIPPED=$skipped
+    INVITE_ALL_FAILED=$failed
+    INVITE_ALL_ERRORS="$errors"
+    INVITE_ALL_WORKOUT="$crossfit_workout"
+    log_message "Invite-all mode: signup done (new=$new_signups already=$already failed=$failed), report deferred"
+    return 0
+  fi
+
   local prefix=""
   $DRY_RUN && prefix="[DRY RUN] "
 
@@ -1122,6 +1315,10 @@ main() {
   acquire_lock
   log_message "=== arbox-signup.sh v$VERSION started ==="
   do_signup
+  if $INVITE_ALL; then
+    invite_friends_to_classes
+    send_invite_all_report
+  fi
   log_message "=== arbox-signup.sh v$VERSION finished ==="
 }
 
