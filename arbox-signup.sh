@@ -18,7 +18,7 @@ set -euo pipefail
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.2.5"
+readonly VERSION="2.2.6"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -301,7 +301,7 @@ curl_with_retry() {
     raw_response=$(cat "$tmp_body" 2>/dev/null || true)
     rm -f "$tmp_body"
     printf '%s' "$http_code" > "$HTTP_STATUS_FILE" 2>/dev/null || true
-    body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' | head -c 300 || true)
+    body_snippet=$(printf '%s' "$raw_response" | tr '\n' ' ' 2>/dev/null | head -c 300 || true)
 
     if [ -n "$raw_response" ] && echo "$raw_response" | jq empty 2>/dev/null; then
       if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
@@ -688,7 +688,15 @@ do_invite_friend() {
     local booking_option
     booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
     log_message "Invite probe: $check_date ($day) - found $check_class_name, booking_option=${booking_option:-absent}"
-    if [ -n "$booking_option" ] && [ "$booking_option" != "registerToSchedule" ]; then
+    # cancelScheduleUser = Aviel is already signed up here: this IS the
+    # workout to invite the friend to. Prefer it over merely-open classes.
+    if [ "$booking_option" = "cancelScheduleUser" ]; then
+      log_message "Invite probe: $check_date ($day) - Aviel is signed up here, invite target"
+      class_id=$(echo "$check_class" | jq -r '.id')
+      class_day="$day"; class_date="$check_date"; class_name="$check_class_name"
+      break
+    fi
+    if [ -n "$booking_option" ] && [ "$booking_option" != "insertScheduleUser" ] && [ "$booking_option" != "registerToSchedule" ]; then
       log_message "Invite probe: $check_date window closed (booking_option=$booking_option), trying next day"
       continue
     fi
@@ -789,13 +797,20 @@ do_signup() {
       continue
     fi
 
-    # Booking window (v2.2.0): Arbox marks each class with booking_option;
-    # 'registerToSchedule' means the window is open right now. Anything else
-    # means it is not open yet (or already closed) — skip WITHOUT counting
-    # it as failed. If the field is absent, proceed as before.
+    # Booking window (live evidence, run #228, Nov 16 2026): booking_option
+    # is the action available for THIS user, not a generic open/closed flag:
+    # 'cancelScheduleUser' = already signed up (the cancel action is what's
+    # offered); 'insertScheduleUser' / 'registerToSchedule' = open now.
+    # Anything else = window not open — skip without counting as failed.
     local booking_option
     booking_option=$(echo "$check_class" | jq -r '.booking_option // empty')
-    if [ -n "$booking_option" ] && [ "$booking_option" != "registerToSchedule" ]; then
+    if [ "$booking_option" = "cancelScheduleUser" ]; then
+      add_to_csv "$check_date" "$signup_hour" "$check_class_name" "already_signed_up"
+      already=$((already + 1))
+      log_message "Day $days_ahead: $check_date - Already signed up (booking_option=cancelScheduleUser)"
+      continue
+    fi
+    if [ -n "$booking_option" ] && [ "$booking_option" != "insertScheduleUser" ] && [ "$booking_option" != "registerToSchedule" ]; then
       log_message "Day $days_ahead: $check_date - Window closed (booking_option=$booking_option), skipping"
       continue
     fi
