@@ -21,7 +21,7 @@ on:
           - list-friends
           - invite-friend
           - check-invite
-                    - invite-all
+          - invite-all
       friend_name:
         description: 'Friend full name (invite-friend only)'
         required: false
