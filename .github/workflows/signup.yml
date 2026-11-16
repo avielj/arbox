@@ -20,6 +20,7 @@ on:
           - signup
           - list-friends
           - invite-friend
+          - check-invite
       friend_name:
         description: 'Friend full name (invite-friend only)'
         required: false
@@ -125,6 +126,9 @@ jobs:
               ;;
             invite-friend)
               ARGS+=(--invite-friend "${{ inputs.friend_name }}")
+              ;;
+              check-invite)
+              ARGS+=(--check-invite "${{ inputs.friend_name }}")
               ;;
             *)
               ;;
