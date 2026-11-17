@@ -138,6 +138,10 @@ jobs:
             *)
               ;;
           esac
+          # Scheduled runs also invite friends to Friday classes only.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+          ARGS+=(--invite-fridays)
+          fi
           ./arbox-signup.sh "${ARGS[@]}"
 
       - name: 📊 Show results
