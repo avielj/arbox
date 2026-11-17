@@ -16,11 +16,12 @@ set -euo pipefail
 #   ./arbox-signup.sh --invite-friend "NAME"  # Invite a friend (POST userToUser/schedule/invite)
 #   ./arbox-signup.sh --check-invite "NAME"   # Check invite status (POST friendConnection/schedule)
 #   ./arbox-signup.sh --invite-all            # Full run: signup 12 days + invite all friends to my classes
+#   ./arbox-signup.sh --invite-fridays        # Daily run: signup 12 days + invite friends to FRIDAY classes only
 #
 # Config priority: CLI args > .env file > defaults
 #=============================================================================
 
-readonly VERSION="2.3.1"
+readonly VERSION="2.3.2"
 readonly LOCK_TIMEOUT=300
 readonly MAX_LOG_SIZE=$((5 * 1024 * 1024))
 readonly CSV_RETENTION_DAYS=30
@@ -57,6 +58,7 @@ LIST_FRIENDS=false
 INVITE_FRIEND=""
 CHECK_INVITE=""
 INVITE_ALL=false
+INVITE_FRIDAYS=false  # daily-run mode: invite friends to Friday classes only
 # Classes Aviel is signed up for (JSON array of {schedule_id, day, date,
 # class, time}) — collected by do_signup for the invite-all phase.
 SIGNED_UP_CLASSES_JSON="[]"
@@ -453,6 +455,7 @@ parse_args() {
         if [ -z "${2:-}" ]; then echo "Error: --check-invite needs a friend name."; exit 1; fi
         CHECK_INVITE="$2"; shift 2 ;;
       --invite-all) INVITE_ALL=true; shift ;;
+      --invite-fridays) INVITE_FRIDAYS=true; shift ;;
       --version) echo "arbox-signup.sh v$VERSION"; exit 0 ;;
       --help)    show_help; exit 0 ;;
       *) echo "Unknown option: $1"; show_help; exit 1 ;;
@@ -488,6 +491,13 @@ Options:
                  are recorded in invites.csv and never re-sent to the same
                  class. One combined Telegram card at the end. Manual use
                  only, never in the daily run.
+  --invite-fridays
+                 Daily run: sign up for the next 12 days, then invite ALL
+                 friends to FRIDAY classes only (the rest of the week is
+                 not invited). Same invites.csv dedupe. Sends a short
+                 Telegram note only on days a new Friday invite went out;
+                 the normal daily signup report is unchanged. Used by the
+                 scheduled workflow run (github.event_name == schedule).
   --version      Show version
   --help         Show this help
 
@@ -886,10 +896,11 @@ send_invite() {
   return 1
 }
 
-# Manual mode (--invite-all): after do_signup, invite EVERY friend to EVERY
-# class in SIGNED_UP_CLASSES_JSON. Dedupe via invites.csv: a friend invited
-# to a class once is never invited to that class again. Sets the INVITES_*
-# globals + INVITE_SUMMARY for the combined report.
+# Invite mode (manual --invite-all or daily --invite-fridays): after
+# do_signup, invite EVERY friend to every class in SIGNED_UP_CLASSES_JSON —
+# or to FRIDAY classes only when INVITE_FRIDAYS is set. Dedupe via
+# invites.csv: a friend invited to a class once is never invited to that
+# class again. Sets the INVITES_* globals + INVITE_SUMMARY for the report.
 invite_friends_to_classes() {
   INVITES_NEW=0; INVITES_SKIPPED=0; INVITES_FAILED=0
   INVITE_SUMMARY=""; INVITE_EXCEPTIONS=""; INVITE_FRIENDS_COUNT=0
@@ -904,8 +915,13 @@ invite_friends_to_classes() {
   friends_json=$(echo "$profile_json" | jq -c '[.data.friend_connection // [] | .[] | {name: (.friend_user.full_name // "unknown"), id: .friend_users_id}]')
   local n_friends
   n_friends=$(echo "$friends_json" | jq 'length')
+  # Friday-only mode (daily run): only Friday classes are invited to.
+  local classes_json="$SIGNED_UP_CLASSES_JSON"
+  if $INVITE_FRIDAYS; then
+    classes_json=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -c '[.[] | select(.day == "Friday")]')
+  fi
   local n_classes
-  n_classes=$(echo "$SIGNED_UP_CLASSES_JSON" | jq 'length')
+  n_classes=$(echo "$classes_json" | jq 'length')
   if [ "$n_classes" = "0" ]; then
     log_message "Invite-all: no signed-up classes in the next $DAYS_AHEAD days, nothing to invite to"
     echo "No signed-up classes found — nothing to invite to."
@@ -917,11 +933,11 @@ invite_friends_to_classes() {
     return 0
   fi
   INVITE_FRIENDS_COUNT=$n_friends
-  log_message "Invite-all: $n_friends friends x $n_classes classes"
+  log_message "Invite-all: $n_friends friends x $n_classes classes (fridays_only=$INVITE_FRIDAYS)"
   local i j
   for ((i=0; i<n_classes; i++)); do
     local cls sid cday cdate cname
-    cls=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -c ".[$i]")
+    cls=$(echo "$classes_json" | jq -c ".[$i]")
     sid=$(echo "$cls" | jq -r '.schedule_id')
     cday=$(echo "$cls" | jq -r '.day')
     cdate=$(echo "$cls" | jq -r '.date')
@@ -1009,6 +1025,19 @@ send_invite_all_report() {
     send_telegram_message "$msg"
     log_message "Invite-all text notification sent"
   fi
+}
+
+# Daily-run Friday note: one short Telegram text line, sent ONLY when the
+# Friday invite phase actually sent new invites (INVITES_NEW > 0). On days
+# with nothing new (dedupe: already invited) nothing extra is sent — the
+# normal daily signup report from do_signup is the only message.
+send_friday_invite_note() {
+  local friday_dates
+  friday_dates=$(echo "$SIGNED_UP_CLASSES_JSON" | jq -r '[.[] | select(.day == "Friday") | (.date | split("-") | .[0] + "." + .[1])] | join(", ")')
+  local msg="📨 הזמנתי את החברים לשישי ($friday_dates): $INVITES_NEW הזמנות חדשות"
+  [ "$INVITES_FAILED" -gt 0 ] && msg="$msg (❌ $INVITES_FAILED נכשלו)"
+  send_telegram_message "$msg"
+  log_message "Friday invite note sent: new=$INVITES_NEW failed=$INVITES_FAILED"
 }
 
 # ── Main signup logic ─────────────────────────────────────────────────────
@@ -1328,6 +1357,12 @@ main() {
   if $INVITE_ALL; then
     invite_friends_to_classes
     send_invite_all_report
+  elif $INVITE_FRIDAYS; then
+    invite_friends_to_classes
+    # Short note only when new Friday invites actually went out.
+    if [ "$INVITES_NEW" -gt 0 ]; then
+      send_friday_invite_note
+    fi
   fi
   log_message "=== arbox-signup.sh v$VERSION finished ==="
 }
