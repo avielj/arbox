@@ -1,12 +1,9 @@
 name: 🏋️ Arbox Auto-Signup
 
 on:
-  # Run daily at 06:01 UTC (same as crontab)
-  # NOTE (v2.2.0): GitHub routinely starts scheduled runs 7-9h late, so this
-  # lands in the afternoon IST. If classes fill up before then, move the
-  # script to a cron on a real server (it was built for that).
+  # scheduled 21:01 UTC, GitHub's 7-9h delay lands it ~06:00-08:00 IST, in time for the morning report.
   schedule:
-    - cron: '1 6 * * *'
+    - cron: '1 21 * * *'
 
   # Allow manual trigger from GitHub UI
   workflow_dispatch:
