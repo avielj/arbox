@@ -103,13 +103,21 @@ jobs:
       - name: 🔑 Restore membership cache
         # v2.2.0: signups.csv is cached too — on ephemeral runners the CSV
         # dedup was dead (every run started with an empty CSV).
+        # v2.3.3: cache entries are immutable — a static key froze
+        # invites.csv since ~Nov 16 (exact key hit skips the save), so new
+        # Friday invites re-sent every run. The key now carries the run id
+        # (unique per run, so the save always happens) and restore-keys
+        # falls back to the most recent previous cache.
         uses: actions/cache@v5
         with:
           path: |
             .arbox_cache
             signups.csv
             invites.csv
-          key: arbox-cache-${{ secrets.ARBOX_EMAIL }}
+          key: arbox-cache-${{ secrets.ARBOX_EMAIL }}-${{ github.run_id }}
+          restore-keys: |
+            arbox-cache-${{ secrets.ARBOX_EMAIL }}-
+            arbox-cache-${{ secrets.ARBOX_EMAIL }}
 
       - name: 🏋️ Run signup script
         run: |
